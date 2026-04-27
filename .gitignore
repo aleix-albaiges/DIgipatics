@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.Python
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+prostata_env/
+venv/
+.env
+.venv/
+
+# ML runs / artifacts
+wandb/
+checkpoints/
+checkpoints_*/
+outputs/
+uni2_features/
+
+# Archives and large data (do not commit)
+*.zip
+images/
+masks/
+
+# Generated / optional local outputs
+visualizations*/
+*.png
+*.csv
+*.json
+tmp_*.csv
+temp_*.py
+
+# OS / editor
+.DS_Store
+Thumbs.db
