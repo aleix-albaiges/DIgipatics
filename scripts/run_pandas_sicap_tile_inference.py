@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from inspect_pandas_masks import (  # type: ignore
+    SICAP_CLASS_NAMES,
+    build_color_palette,
+    colorize_mask,
+    ensure_runtime_dependencies,
+    extract_label_ids,
+    infer_pandas_mask_schema,
+    normalize_to_uint8,
+    overlay,
+    pair_cases,
+    read_tiff_level,
+    resize_image,
+    summarize_mask,
+    get_tiff_structure,
+)
+from training_conch_final import CONCHSegModel
+
+LOGGER = logging.getLogger("run_pandas_sicap_tile_inference")
+MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+CLASS_NAMES = [SICAP_CLASS_NAMES[idx] for idx in range(4)]
+RADBOUD_TO_SICAP = {0: 0, 1: 0, 2: 0, 3: 1, 4: 2, 5: 3}
+KAROLINSKA_TO_SICAP = {0: 0, 1: 0, 2: 0}
+
+
+@dataclass
+class CaseInfo:
+    case_id: str
+    wsi_path: Path
+    mask_path: Path
+    mask_structure: Dict[str, object]
+    wsi_structure: Dict[str, object]
+    schema_name: str
+    pandas_to_sicap: Dict[int, int]
+    can_map_gleason: bool
+    observed_labels: List[int]
+    data_provider: str
+    isup_grade: Optional[str]
+    gleason_score: Optional[str]
+
+
+@dataclass
+class TileRecord:
+    tile_index: int
+    x: int
+    y: int
+    level_index: int
+    tumor_fraction: float
+    tissue_fraction: float
+    metrics: Dict[str, object]
+    gt_mask: np.ndarray
+    pred_mask: np.ndarray
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run SICAPv2 checkpoint inference on PANDAS WSI tiles at target magnification."
+    )
+    parser.add_argument("--data-dir", type=Path, default=Path("PANDAS"))
+    parser.add_argument(
+        "--train-csv",
+        type=Path,
+        default=None,
+        help="CSV metadata de PANDA (si no se indica: <data-dir>/train.csv).",
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/pandas_tile_inference"))
+    parser.add_argument("--checkpoints-csv", type=Path, default=Path("checkpoints_conch_masklut/best_per_fold.csv"))
+    parser.add_argument("--fold", type=str, default=None, help="Fold to use from the CSV. Defaults to best macro_f1.")
+    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Direct checkpoint path override.")
+    parser.add_argument("--case-id", type=str, nargs="*", default=None, help="Optional list of specific PANDAS case ids.")
+    parser.add_argument("--max-cases", type=int, default=5)
+    parser.add_argument("--max-tiles-per-case", type=int, default=12)
+    parser.add_argument("--tile-size", type=int, default=512)
+    parser.add_argument("--stride", type=int, default=512)
+    parser.add_argument("--target-magnification", type=float, default=10.0)
+    parser.add_argument("--source-magnification", type=float, default=40.0)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--thumb-size", type=int, default=1024)
+    parser.add_argument("--tissue-threshold", type=float, default=0.15)
+    parser.add_argument("--min-tumor-fraction", type=float, default=0.01)
+    parser.add_argument("--allow-karolinska", action="store_true")
+    parser.add_argument("--log-level", type=str, default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    return parser.parse_args()
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(level=getattr(logging, level), format="%(asctime)s | %(levelname)s | %(message)s")
+
+
+def resolve_device(device_name: str) -> torch.device:
+    if device_name == "cuda" and not torch.cuda.is_available():
+        LOGGER.warning("CUDA no disponible. Se usará CPU.")
+        return torch.device("cpu")
+    return torch.device(device_name)
+
+
+def load_checkpoint_row(csv_path: Path, fold: Optional[str]) -> Tuple[Dict[str, object], Path]:
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        raise RuntimeError(f"No checkpoints found in {csv_path}")
+    if fold:
+        selected = df[df["fold"].astype(str) == str(fold)]
+        if selected.empty:
+            raise ValueError(f"Fold {fold} not found in {csv_path}")
+        row = selected.sort_values("macro_f1", ascending=False).iloc[0]
+    else:
+        row = df.sort_values("macro_f1", ascending=False).iloc[0]
+    checkpoint_path = Path(str(row["checkpoint_path"]))
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = (REPO_ROOT / checkpoint_path).resolve()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    return row.to_dict(), checkpoint_path
+
+
+def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
+    LOGGER.info("Loading checkpoint %s", checkpoint_path)
+    model = CONCHSegModel(num_classes=4, unfreeze_last=0)
+    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def load_train_metadata(train_csv: Optional[Path], data_dir: Path) -> Dict[str, Dict[str, str]]:
+    csv_path = train_csv if train_csv is not None else (data_dir / "train.csv")
+    if not csv_path.exists():
+        LOGGER.warning("train.csv no encontrado en %s. Se usará solo inferencia por valores de máscara.", csv_path)
+        return {}
+    df = pd.read_csv(csv_path)
+    if "image_id" not in df.columns:
+        LOGGER.warning("%s no contiene columna image_id. Se ignorará para filtrado/anotación.", csv_path)
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    cols = set(df.columns)
+    for _, row in df.iterrows():
+        image_id = str(row["image_id"])
+        out[image_id] = {
+            "data_provider": str(row["data_provider"]) if "data_provider" in cols and pd.notna(row["data_provider"]) else "",
+            "isup_grade": str(row["isup_grade"]) if "isup_grade" in cols and pd.notna(row["isup_grade"]) else "",
+            "gleason_score": str(row["gleason_score"]) if "gleason_score" in cols and pd.notna(row["gleason_score"]) else "",
+        }
+    LOGGER.info("Metadata cargada: %s filas desde %s", len(out), csv_path)
+    return out
+
+
+def level_downsamples(structure: Dict[str, object]) -> List[float]:
+    level_shapes = structure["level_shapes"]
+    base_h, base_w = level_shapes[0][0], level_shapes[0][1]
+    factors: List[float] = []
+    for shape in level_shapes:
+        h, w = shape[0], shape[1]
+        factors.append(float((base_h / h + base_w / w) / 2.0))
+    return factors
+
+
+def choose_level_for_magnification(structure: Dict[str, object], source_magnification: float, target_magnification: float) -> Tuple[int, float]:
+    desired_downsample = float(source_magnification) / float(target_magnification)
+    factors = level_downsamples(structure)
+    level_index = min(range(len(factors)), key=lambda idx: abs(math.log(factors[idx] + 1e-8) - math.log(desired_downsample + 1e-8)))
+    effective_magnification = float(source_magnification) / factors[level_index]
+    return level_index, effective_magnification
+
+
+def inspect_case(
+    mask_path: Path,
+    wsi_path: Path,
+    source_magnification: float,
+    target_magnification: float,
+    train_meta: Optional[Dict[str, str]] = None,
+) -> CaseInfo:
+    mask_structure = get_tiff_structure(mask_path)
+    wsi_structure = get_tiff_structure(wsi_path)
+    # Para decidir esquema/clases, evitamos el nivel más bajo (puede perder etiquetas).
+    preview_level, _ = choose_level_for_magnification(mask_structure, source_magnification, target_magnification)
+    mask_preview = read_tiff_level(mask_path, preview_level)
+    mask_summary = summarize_mask(mask_preview, max_unique_report=32, exact_decode=False, structure=mask_structure)
+    observed_labels = [int(v) for v in mask_summary.get("derived_label_ids", mask_summary.get("palette_values", []))]
+    label_ids = extract_label_ids(mask_preview)
+    schema_from_pixels, pandas_to_sicap, _, can_map_gleason = infer_pandas_mask_schema(label_ids)
+
+    provider = (train_meta or {}).get("data_provider", "").strip().lower()
+    # Para clases por píxel, priorizamos lo que realmente existe en la máscara.
+    schema_name = schema_from_pixels
+    if schema_from_pixels == "radboud_pattern_mask":
+        pandas_to_sicap = dict(RADBOUD_TO_SICAP)
+        can_map_gleason = True
+    else:
+        pandas_to_sicap = dict(KAROLINSKA_TO_SICAP)
+        can_map_gleason = False
+
+    if provider and ((provider == "radboud" and schema_from_pixels != "radboud_pattern_mask") or (provider == "karolinska" and schema_from_pixels != "karolinska_binary_mask")):
+        LOGGER.warning(
+            "Case %s: discrepancia CSV(%s) vs máscara(%s). Para segmentación por píxel se prioriza máscara.",
+            wsi_path.stem,
+            provider,
+            schema_from_pixels,
+        )
+    return CaseInfo(
+        case_id=wsi_path.stem,
+        wsi_path=wsi_path,
+        mask_path=mask_path,
+        mask_structure=mask_structure,
+        wsi_structure=wsi_structure,
+        schema_name=schema_name,
+        pandas_to_sicap=pandas_to_sicap,
+        can_map_gleason=can_map_gleason,
+        observed_labels=observed_labels,
+        data_provider=provider or "unknown",
+        isup_grade=(train_meta or {}).get("isup_grade") or None,
+        gleason_score=(train_meta or {}).get("gleason_score") or None,
+    )
+
+
+def discover_cases(
+    data_dir: Path,
+    explicit_case_ids: Optional[Sequence[str]],
+    allow_karolinska: bool,
+    max_cases: int,
+    source_magnification: float,
+    target_magnification: float,
+    train_metadata: Optional[Dict[str, Dict[str, str]]] = None,
+) -> List[CaseInfo]:
+    candidates: List[CaseInfo] = []
+    explicit = set(explicit_case_ids or [])
+    for pair in pair_cases(data_dir):
+        if explicit and pair.case_id not in explicit:
+            continue
+        if not pair.wsi_path:
+            LOGGER.warning("Skipping %s: no matching WSI.", pair.case_id)
+            continue
+        case = inspect_case(
+            Path(pair.mask_path),
+            Path(pair.wsi_path),
+            source_magnification=source_magnification,
+            target_magnification=target_magnification,
+            train_meta=(train_metadata or {}).get(pair.case_id),
+        )
+        if not case.can_map_gleason and not allow_karolinska:
+            LOGGER.info("Skipping %s: mask schema %s cannot map to SICAP Gleason classes.", case.case_id, case.schema_name)
+            continue
+        candidates.append(case)
+
+    candidates.sort(key=lambda item: (not item.can_map_gleason, item.case_id))
+    if max_cases > 0:
+        candidates = candidates[:max_cases]
+    if not candidates:
+        raise RuntimeError("No PANDAS cases available for SICAP-compatible tile inference.")
+    return candidates
+
+
+def remap_pandas_mask_to_sicap(mask: np.ndarray, pandas_to_sicap: Dict[int, int]) -> np.ndarray:
+    label_ids = extract_label_ids(mask)
+    remapped = np.zeros(label_ids.shape, dtype=np.uint8)
+    for src_value, dst_value in pandas_to_sicap.items():
+        remapped[label_ids == int(src_value)] = int(dst_value)
+    return remapped
+
+
+def compute_tissue_fraction(image: np.ndarray) -> float:
+    image_f = image.astype(np.float32)
+    gray = 0.299 * image_f[..., 0] + 0.587 * image_f[..., 1] + 0.114 * image_f[..., 2]
+    tissue = gray < 235.0
+    return float(tissue.mean())
+
+
+def enumerate_tiles(image: np.ndarray, mask: np.ndarray, tile_size: int, stride: int, min_tissue: float, min_tumor_fraction: float) -> List[Dict[str, object]]:
+    h, w = mask.shape
+    tiles: List[Dict[str, object]] = []
+    for y in range(0, max(h - tile_size + 1, 1), stride):
+        for x in range(0, max(w - tile_size + 1, 1), stride):
+            y1 = min(y + tile_size, h)
+            x1 = min(x + tile_size, w)
+            if (y1 - y) != tile_size or (x1 - x) != tile_size:
+                continue
+            img_tile = image[y:y1, x:x1]
+            mask_tile = mask[y:y1, x:x1]
+            tissue_fraction = compute_tissue_fraction(img_tile)
+            tumor_fraction = float((mask_tile > 0).mean())
+            if tissue_fraction < min_tissue:
+                continue
+            if tumor_fraction < min_tumor_fraction:
+                continue
+            tiles.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "image": img_tile,
+                    "mask": mask_tile,
+                    "tissue_fraction": tissue_fraction,
+                    "tumor_fraction": tumor_fraction,
+                }
+            )
+    tiles.sort(key=lambda item: (item["tumor_fraction"], item["tissue_fraction"]), reverse=True)
+    return tiles
+
+
+def preprocess_tile(tile_rgb: np.ndarray) -> torch.Tensor:
+    image = tile_rgb.astype(np.float32) / 255.0
+    image = (image - MEAN) / STD
+    image = np.transpose(image, (2, 0, 1))
+    return torch.from_numpy(image).float()
+
+
+def confusion_matrix(pred: np.ndarray, target: np.ndarray, num_classes: int = 4) -> np.ndarray:
+    valid = (target >= 0) & (target < num_classes)
+    matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    np.add.at(matrix, (target[valid], pred[valid]), 1)
+    return matrix
+
+
+def metrics_from_confusion(cm: np.ndarray) -> Dict[str, object]:
+    total = cm.sum()
+    acc = float(np.trace(cm) / total) if total > 0 else 0.0
+    dice_per_class: Dict[str, float] = {}
+    iou_per_class: Dict[str, float] = {}
+    for idx, name in enumerate(CLASS_NAMES):
+        tp = cm[idx, idx]
+        fp = cm[:, idx].sum() - tp
+        fn = cm[idx, :].sum() - tp
+        denom_dice = 2 * tp + fp + fn
+        denom_iou = tp + fp + fn
+        dice_per_class[name] = float((2 * tp) / denom_dice) if denom_dice > 0 else float("nan")
+        iou_per_class[name] = float(tp / denom_iou) if denom_iou > 0 else float("nan")
+    macro_dice = float(np.nanmean(list(dice_per_class.values())))
+    macro_iou = float(np.nanmean(list(iou_per_class.values())))
+    return {
+        "pixel_accuracy": acc,
+        "dice_per_class": dice_per_class,
+        "iou_per_class": iou_per_class,
+        "macro_dice": macro_dice,
+        "macro_iou": macro_iou,
+        "confusion_matrix": cm.tolist(),
+    }
+
+
+def batched_inference(model: torch.nn.Module, images: Sequence[np.ndarray], device: torch.device, batch_size: int) -> List[np.ndarray]:
+    outputs: List[np.ndarray] = []
+    with torch.inference_mode():
+        for start in range(0, len(images), batch_size):
+            batch = images[start : start + batch_size]
+            tensor = torch.stack([preprocess_tile(tile) for tile in batch]).to(device, non_blocking=True)
+            logits = model(tensor)
+            preds = logits.argmax(dim=1).cpu().numpy().astype(np.uint8)
+            outputs.extend([preds[idx] for idx in range(preds.shape[0])])
+    return outputs
+
+
+def save_tile_visuals(case_dir: Path, image_tile: np.ndarray, gt_mask: np.ndarray, pred_mask: np.ndarray, tile_name: str) -> Dict[str, object]:
+    from PIL import Image
+    import matplotlib.pyplot as plt
+
+    palette = build_color_palette(np.asarray([0, 1, 2, 3], dtype=np.int64))
+    gt_rgb = colorize_mask(gt_mask, palette)
+    pred_rgb = colorize_mask(pred_mask, palette)
+    err_mask = (gt_mask != pred_mask).astype(np.uint8)
+    err_rgb = np.zeros((*err_mask.shape, 3), dtype=np.uint8)
+    err_rgb[err_mask == 1] = np.asarray((255, 0, 0), dtype=np.uint8)
+
+    Image.fromarray(image_tile).save(case_dir / f"{tile_name}_image.png")
+    Image.fromarray(gt_rgb).save(case_dir / f"{tile_name}_gt_mask.png")
+    Image.fromarray(pred_rgb).save(case_dir / f"{tile_name}_pred_mask.png")
+    Image.fromarray(overlay(image_tile, gt_rgb)).save(case_dir / f"{tile_name}_gt_overlay.png")
+    Image.fromarray(overlay(image_tile, pred_rgb)).save(case_dir / f"{tile_name}_pred_overlay.png")
+    Image.fromarray(overlay(image_tile, err_rgb, alpha=0.35)).save(case_dir / f"{tile_name}_error_overlay.png")
+
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    axes[0].imshow(image_tile)
+    axes[0].set_title("Image")
+    axes[1].imshow(overlay(image_tile, gt_rgb))
+    axes[1].set_title("GT")
+    axes[2].imshow(overlay(image_tile, pred_rgb))
+    axes[2].set_title("Prediction")
+    axes[3].imshow(overlay(image_tile, err_rgb, alpha=0.35))
+    axes[3].set_title("Error")
+    for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(case_dir / f"{tile_name}_panel.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "image": f"{tile_name}_image.png",
+        "gt_mask": f"{tile_name}_gt_mask.png",
+        "pred_mask": f"{tile_name}_pred_mask.png",
+        "gt_overlay": f"{tile_name}_gt_overlay.png",
+        "pred_overlay": f"{tile_name}_pred_overlay.png",
+        "error_overlay": f"{tile_name}_error_overlay.png",
+        "panel": f"{tile_name}_panel.png",
+    }
+
+
+def save_case_overview(case_dir: Path, image: np.ndarray, mask: np.ndarray, pred_tiles: Sequence[TileRecord], thumb_size: int) -> None:
+    from PIL import Image
+
+    palette = build_color_palette(np.asarray([0, 1, 2, 3], dtype=np.int64))
+    image_thumb = resize_image(image, thumb_size, is_mask=False)
+    mask_thumb = resize_image(mask, thumb_size, is_mask=True)
+    mask_rgb = colorize_mask(mask_thumb, palette)
+    Image.fromarray(image_thumb).save(case_dir / "case_thumbnail.png")
+    Image.fromarray(mask_rgb).save(case_dir / "case_gt_mask.png")
+    Image.fromarray(overlay(image_thumb, mask_rgb)).save(case_dir / "case_gt_overlay.png")
+
+    # Reconstruye una vista global de predicción uniendo todos los tiles seleccionados.
+    h, w = mask.shape
+    pred_canvas = np.zeros((h, w), dtype=np.uint8)
+    gt_canvas = np.zeros((h, w), dtype=np.uint8)
+    coverage = np.zeros((h, w), dtype=np.uint8)
+    for tile in pred_tiles:
+        th, tw = tile.pred_mask.shape
+        y0, x0 = tile.y, tile.x
+        y1, x1 = min(y0 + th, h), min(x0 + tw, w)
+        pred_canvas[y0:y1, x0:x1] = tile.pred_mask[: y1 - y0, : x1 - x0]
+        gt_canvas[y0:y1, x0:x1] = tile.gt_mask[: y1 - y0, : x1 - x0]
+        coverage[y0:y1, x0:x1] = 255
+
+    np.save(case_dir / "case_pred_mask_mosaic_class.npy", pred_canvas)
+    np.save(case_dir / "case_gt_mask_mosaic_class.npy", gt_canvas)
+    Image.fromarray(pred_canvas, mode="L").save(case_dir / "case_pred_mask_mosaic_class.png")
+    Image.fromarray(gt_canvas, mode="L").save(case_dir / "case_gt_mask_mosaic_class.png")
+
+    pred_thumb = resize_image(pred_canvas, thumb_size, is_mask=True)
+    gt_thumb = resize_image(gt_canvas, thumb_size, is_mask=True)
+    cov_thumb = resize_image(coverage, thumb_size, is_mask=True)
+    pred_rgb = colorize_mask(pred_thumb, palette)
+    gt_sel_rgb = colorize_mask(gt_thumb, palette)
+    Image.fromarray(pred_rgb).save(case_dir / "case_pred_mask_mosaic.png")
+    Image.fromarray(gt_sel_rgb).save(case_dir / "case_gt_mask_mosaic.png")
+    Image.fromarray(overlay(image_thumb, pred_rgb)).save(case_dir / "case_pred_overlay_mosaic.png")
+    Image.fromarray(overlay(image_thumb, gt_sel_rgb)).save(case_dir / "case_gt_overlay_mosaic.png")
+    Image.fromarray(cov_thumb).save(case_dir / "case_tile_coverage_mosaic.png")
+    summary = [
+        {
+            "tile_index": tile.tile_index,
+            "x": tile.x,
+            "y": tile.y,
+            "level_index": tile.level_index,
+            "tumor_fraction": tile.tumor_fraction,
+            "tissue_fraction": tile.tissue_fraction,
+        }
+        for tile in pred_tiles
+    ]
+    (case_dir / "selected_tiles.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def run_case(
+    case: CaseInfo,
+    model: torch.nn.Module,
+    output_dir: Path,
+    tile_size: int,
+    stride: int,
+    batch_size: int,
+    device: torch.device,
+    target_magnification: float,
+    source_magnification: float,
+    max_tiles_per_case: int,
+    tissue_threshold: float,
+    min_tumor_fraction: float,
+    thumb_size: int,
+) -> Dict[str, object]:
+    level_index, effective_mag = choose_level_for_magnification(case.wsi_structure, source_magnification, target_magnification)
+    LOGGER.info("Case %s -> level %s (effective %.2fx)", case.case_id, level_index, effective_mag)
+    wsi = read_tiff_level(case.wsi_path, level_index)
+    mask = read_tiff_level(case.mask_path, level_index)
+    if wsi.ndim == 2:
+        wsi = np.repeat(wsi[..., None], 3, axis=2)
+    elif wsi.ndim == 3 and wsi.shape[0] in {3, 4} and wsi.shape[-1] not in {3, 4}:
+        wsi = np.moveaxis(wsi, 0, -1)
+    if wsi.ndim == 3 and wsi.shape[-1] == 4:
+        wsi = wsi[..., :3]
+    if wsi.dtype != np.uint8:
+        wsi = normalize_to_uint8(wsi)
+    if mask.ndim == 3 and mask.shape[0] in {1, 3, 4} and mask.shape[-1] not in {1, 3, 4}:
+        mask = np.moveaxis(mask, 0, -1)
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
+    mapped_mask = remap_pandas_mask_to_sicap(mask, case.pandas_to_sicap)
+
+    tiles = enumerate_tiles(
+        image=wsi,
+        mask=mapped_mask,
+        tile_size=tile_size,
+        stride=stride,
+        min_tissue=tissue_threshold,
+        min_tumor_fraction=min_tumor_fraction,
+    )[:max_tiles_per_case]
+    if not tiles:
+        raise RuntimeError(f"No valid tiles found for case {case.case_id} at level {level_index}")
+
+    predictions = batched_inference(model, [tile["image"] for tile in tiles], device=device, batch_size=batch_size)
+    case_dir = output_dir / case.case_id
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    tile_rows: List[Dict[str, object]] = []
+    aggregate_cm = np.zeros((4, 4), dtype=np.int64)
+    tile_records: List[TileRecord] = []
+    for idx, (tile, pred_mask) in enumerate(zip(tiles, predictions)):
+        gt_mask = tile["mask"].astype(np.uint8)
+        cm = confusion_matrix(pred_mask, gt_mask, num_classes=4)
+        metrics = metrics_from_confusion(cm)
+        aggregate_cm += cm
+        tile_name = f"tile_{idx:03d}_x{tile['x']}_y{tile['y']}"
+        paths = save_tile_visuals(case_dir, tile["image"], gt_mask, pred_mask, tile_name)
+        row = {
+            "case_id": case.case_id,
+            "tile_index": idx,
+            "x": int(tile["x"]),
+            "y": int(tile["y"]),
+            "level_index": level_index,
+            "effective_magnification": effective_mag,
+            "tumor_fraction": float(tile["tumor_fraction"]),
+            "tissue_fraction": float(tile["tissue_fraction"]),
+            **{f"dice_{name}": metrics["dice_per_class"][name] for name in CLASS_NAMES},
+            **{f"iou_{name}": metrics["iou_per_class"][name] for name in CLASS_NAMES},
+            "pixel_accuracy": metrics["pixel_accuracy"],
+            "macro_dice": metrics["macro_dice"],
+            "macro_iou": metrics["macro_iou"],
+            **paths,
+        }
+        tile_rows.append(row)
+        tile_records.append(
+            TileRecord(
+                tile_index=idx,
+                x=int(tile["x"]),
+                y=int(tile["y"]),
+                level_index=level_index,
+                tumor_fraction=float(tile["tumor_fraction"]),
+                tissue_fraction=float(tile["tissue_fraction"]),
+                metrics=metrics,
+                gt_mask=gt_mask.copy(),
+                pred_mask=pred_mask.copy(),
+            )
+        )
+
+    pd.DataFrame(tile_rows).to_csv(case_dir / "tile_metrics.csv", index=False)
+    aggregate_metrics = metrics_from_confusion(aggregate_cm)
+    save_case_overview(case_dir, wsi, mapped_mask, tile_records, thumb_size=thumb_size)
+
+    summary = {
+        "case_id": case.case_id,
+        "data_provider": case.data_provider,
+        "isup_grade": case.isup_grade,
+        "gleason_score": case.gleason_score,
+        "schema_name": case.schema_name,
+        "observed_labels": case.observed_labels,
+        "level_index": level_index,
+        "effective_magnification": effective_mag,
+        "num_tiles": len(tile_rows),
+        "aggregate_metrics": aggregate_metrics,
+    }
+    (case_dir / "case_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
+def main() -> None:
+    args = parse_args()
+    configure_logging(args.log_level)
+    ensure_runtime_dependencies()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = resolve_device(args.device)
+    if args.checkpoint_path is not None:
+        checkpoint_row = {"fold": "manual", "macro_f1": None, "checkpoint_path": str(args.checkpoint_path)}
+        checkpoint_path = args.checkpoint_path.resolve()
+    else:
+        checkpoint_row, checkpoint_path = load_checkpoint_row(args.checkpoints_csv, args.fold)
+
+    train_metadata = load_train_metadata(args.train_csv, args.data_dir)
+    cases = discover_cases(
+        data_dir=args.data_dir,
+        explicit_case_ids=args.case_id,
+        allow_karolinska=args.allow_karolinska,
+        max_cases=args.max_cases,
+        source_magnification=args.source_magnification,
+        target_magnification=args.target_magnification,
+        train_metadata=train_metadata,
+    )
+    model = load_model(checkpoint_path, device=device)
+
+    case_summaries: List[Dict[str, object]] = []
+    for case in cases:
+        try:
+            case_summary = run_case(
+                case=case,
+                model=model,
+                output_dir=args.output_dir,
+                tile_size=args.tile_size,
+                stride=args.stride,
+                batch_size=args.batch_size,
+                device=device,
+                target_magnification=args.target_magnification,
+                source_magnification=args.source_magnification,
+                max_tiles_per_case=args.max_tiles_per_case,
+                tissue_threshold=args.tissue_threshold,
+                min_tumor_fraction=args.min_tumor_fraction,
+                thumb_size=args.thumb_size,
+            )
+            case_summaries.append(case_summary)
+        except RuntimeError as exc:
+            LOGGER.warning("Skipping case %s: %s", case.case_id, exc)
+            continue
+
+    run_summary = {
+        "checkpoint": checkpoint_row,
+        "resolved_checkpoint_path": str(checkpoint_path),
+        "device": str(device),
+        "target_magnification": float(args.target_magnification),
+        "source_magnification": float(args.source_magnification),
+        "tile_size": int(args.tile_size),
+        "stride": int(args.stride),
+        "batch_size": int(args.batch_size),
+        "cases": case_summaries,
+    }
+    (args.output_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
+    pd.DataFrame(case_summaries).to_csv(args.output_dir / "case_summary.csv", index=False)
+    LOGGER.info("Inference written to %s", args.output_dir)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+=== PARCHES - Etiqueta Excel ===
+
+Apariciones TOTALES en los 4 folds (Train + Test):
+Class 0: 19509
+Class 1: 9538
+Class 2: 19058
+Class 3: 3812
+Suma: 51917
+None: 0
+
+Parches UNICOS (solo se cuenta 1 vez por imagen):
+Class 0: 4417
+Class 1: 2222
+Class 2: 4494
+Class 3: 948
+Suma: 12081

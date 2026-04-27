@@ -1,0 +1,38 @@
+=== PIXELES - solo LUT ===
+Mascaras leidas OK: 12,081
+Total pixeles: 3,166,961,664
+
+Pixeles por clase:
+  clase    id       absolutos         %
+  --------------------------------------------
+  NC        0   2,463,162,516     77.78
+  GG3       1     184,200,780      5.82
+  GG4       2     435,866,579     13.76
+  GG5       3      83,731,789      2.64
+  --------------------------------------------
+  SUMA          3,166,961,664    100.00
+  Resumen absolutos: NC=2,463,162,516, GG3=184,200,780, GG4=435,866,579, GG5=83,731,789
+
+Patches con >=1 pixel de cada clase:
+  (Clases no excluyentes: un mismo parche puede contar en varias filas; los % no suman 100%.)
+  clase    id       absolutos         %
+  --------------------------------------------
+  NC        0          12,077     99.97
+  GG3       1           7,653     63.35
+  GG4       2           6,449     53.38
+  GG5       3           2,517     20.83
+  --------------------------------------------
+  SUMA                 28,696       ---
+  Resumen absolutos: NC=12,077, GG3=7,653, GG4=6,449, GG5=2,517
+
+Patches segun clase mayoritaria en la mascara (clase ganadora a nivel de parche):
+  clase    id       absolutos         %
+  --------------------------------------------
+  NC        0          10,038     83.09
+  GG3       1             496      4.11
+  GG4       2           1,294     10.71
+  GG5       3             253      2.09
+  --------------------------------------------
+  SUMA                 12,081    100.00
+  Resumen absolutos: NC=10,038, GG3=496, GG4=1,294, GG5=253
+
