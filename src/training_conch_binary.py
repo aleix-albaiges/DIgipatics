@@ -595,7 +595,7 @@ def validate_one_epoch(model, loader, criterion, device, eval_threshold=0.5, thr
         metrics.update_batch(logits, masks)
 
         if threshold_cms:
-            probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+            probs = torch.softmax(logits.float(), dim=1)[:, 1].detach().cpu().numpy()
             tgts = masks.cpu().numpy()
             valid = (tgts >= 0) & (tgts < 2)
             for t, cm in threshold_cms.items():
