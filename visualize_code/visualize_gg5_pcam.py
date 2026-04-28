@@ -11,8 +11,17 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
 import random
+
+_SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import sicap_imports  # noqa: F401
+
+from paths import IMAGES_DIR, MASKS_DIR, PARTITION_DIR, default_checkpoint_dir
 
 import cv2
 import numpy as np
@@ -26,10 +35,6 @@ from training_pcam import (
     build_model,
     get_val_transforms,
     SICAPv2Dataset,
-    BASE_DIR,
-    IMAGES_DIR,
-    MASKS_DIR,
-    PARTITION_DIR,
     DEFAULT_CONFIG,
     ENCODER_PRESETS,
     CLASS_NAMES,
@@ -88,7 +93,11 @@ def _predict_with_gg5_threshold(logits: torch.Tensor, gg5_threshold: float) -> t
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fold", type=int, default=3, choices=[1, 2, 3, 4])
-    parser.add_argument("--checkpoint-dir", type=str, default=str(BASE_DIR / "checkpoints_nature_pcam"))
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=str(default_checkpoint_dir("checkpoints_nature_pcam")),
+    )
     parser.add_argument("--max-scan", type=int, default=200)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--out-name", type=str, default="gg5_pcam_correct.png")
@@ -118,7 +127,7 @@ def main():
 
     fold_dir = PARTITION_DIR / "Validation" / f"Val{args.fold}"
     val_df = pd.read_excel(fold_dir / "Test.xlsx")
-    # Para encontrar un caso rápido para la presentación, barajamos las imágenes.
+    # Para encontrar un caso rápido para la presentación, barajamos las images.
     # (Val3 puede tener ~1800 samples; en orden pueden tardar en aparecer TN/TP correctos de GG5.)
     val_names = val_df["image_name"].tolist()
     random.shuffle(val_names)

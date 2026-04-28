@@ -111,7 +111,7 @@ def configure_logging(level: str) -> None:
 
 def resolve_device(device_name: str) -> torch.device:
     if device_name == "cuda" and not torch.cuda.is_available():
-        LOGGER.warning("CUDA no disponible. Se usará CPU.")
+        LOGGER.warning("CUDA unavailable. CPU will be used.")
         return torch.device("cpu")
     return torch.device(device_name)
 
@@ -148,11 +148,11 @@ def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
 def load_train_metadata(train_csv: Optional[Path], data_dir: Path) -> Dict[str, Dict[str, str]]:
     csv_path = train_csv if train_csv is not None else (data_dir / "train.csv")
     if not csv_path.exists():
-        LOGGER.warning("train.csv no encontrado en %s. Se usará solo inferencia por valores de máscara.", csv_path)
+        LOGGER.warning("train.csv not found en %s. Se usará only inferencia por valores de mask.", csv_path)
         return {}
     df = pd.read_csv(csv_path)
     if "image_id" not in df.columns:
-        LOGGER.warning("%s no contiene columna image_id. Se ignorará para filtrado/anotación.", csv_path)
+        LOGGER.warning("%s no contiene column image_id. Will be ignored para filtrado/anotación.", csv_path)
         return {}
     out: Dict[str, Dict[str, str]] = {}
     cols = set(df.columns)
@@ -163,7 +163,7 @@ def load_train_metadata(train_csv: Optional[Path], data_dir: Path) -> Dict[str, 
             "isup_grade": str(row["isup_grade"]) if "isup_grade" in cols and pd.notna(row["isup_grade"]) else "",
             "gleason_score": str(row["gleason_score"]) if "gleason_score" in cols and pd.notna(row["gleason_score"]) else "",
         }
-    LOGGER.info("Metadata cargada: %s filas desde %s", len(out), csv_path)
+    LOGGER.info("Metadata cargada: %s rows desde %s", len(out), csv_path)
     return out
 
 
@@ -194,7 +194,7 @@ def inspect_case(
 ) -> CaseInfo:
     mask_structure = get_tiff_structure(mask_path)
     wsi_structure = get_tiff_structure(wsi_path)
-    # Para decidir esquema/clases, evitamos el nivel más bajo (puede perder etiquetas).
+    # Para decidir esquema/clases, we avoid the lowest level (it can lose labels).
     preview_level, _ = choose_level_for_magnification(mask_structure, source_magnification, target_magnification)
     mask_preview = read_tiff_level(mask_path, preview_level)
     mask_summary = summarize_mask(mask_preview, max_unique_report=32, exact_decode=False, structure=mask_structure)
@@ -203,7 +203,7 @@ def inspect_case(
     schema_from_pixels, pandas_to_sicap, _, can_map_gleason = infer_pandas_mask_schema(label_ids)
 
     provider = (train_meta or {}).get("data_provider", "").strip().lower()
-    # Para clases por píxel, priorizamos lo que realmente existe en la máscara.
+    # Para clases por pixel, we prioritize lo que actually exists en la mask.
     schema_name = schema_from_pixels
     if schema_from_pixels == "radboud_pattern_mask":
         pandas_to_sicap = dict(RADBOUD_TO_SICAP)
@@ -214,7 +214,7 @@ def inspect_case(
 
     if provider and ((provider == "radboud" and schema_from_pixels != "radboud_pattern_mask") or (provider == "karolinska" and schema_from_pixels != "karolinska_binary_mask")):
         LOGGER.warning(
-            "Case %s: discrepancia CSV(%s) vs máscara(%s). Para segmentación por píxel se prioriza máscara.",
+            "Case %s: mismatch CSV(%s) vs mask(%s). Para segmentación por pixel is prioritized mask.",
             wsi_path.stem,
             provider,
             schema_from_pixels,
@@ -424,7 +424,7 @@ def save_case_overview(case_dir: Path, image: np.ndarray, mask: np.ndarray, pred
     Image.fromarray(mask_rgb).save(case_dir / "case_gt_mask.png")
     Image.fromarray(overlay(image_thumb, mask_rgb)).save(case_dir / "case_gt_overlay.png")
 
-    # Reconstruye una vista global de predicción uniendo todos los tiles seleccionados.
+    # Reconstruct una vista global de predicción uniendo todos los tiles seleccionados.
     h, w = mask.shape
     pred_canvas = np.zeros((h, w), dtype=np.uint8)
     gt_canvas = np.zeros((h, w), dtype=np.uint8)

@@ -10,8 +10,15 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
 import math
+
+_SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import sicap_imports  # noqa: F401
 
 import cv2
 import numpy as np
@@ -80,7 +87,7 @@ def main():
     parser.add_argument("--use-filenames-txt", action="store_true")
     args = parser.parse_args()
 
-    out_dir = Path(args.out).parent if args.out else Path(__file__).resolve().parent / "imágenes prediction"
+    out_dir = Path(args.out).parent if args.out else Path(__file__).resolve().parent / "images prediction"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.out:

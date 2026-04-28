@@ -10,7 +10,14 @@ Usage:
 
 import argparse
 import random
+import sys
 from pathlib import Path
+
+_SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import sicap_imports  # noqa: F401
 
 import numpy as np
 import cv2
@@ -214,7 +221,7 @@ def main():
 
         pred_has_gg5 = bool((pred == 3).any())
         gt_has_gg5 = bool((gt == 3).any())
-        # "Predice GG5 y acierta" -> ambos contienen la clase 3 (no exige píxeles solapados).
+        # "Predice GG5 y acierta" -> ambos contienen la clase 3 (no exige pixeles solapados).
         gg5_overlap = bool(pred_has_gg5 and gt_has_gg5)
 
         if save_path is not None:
@@ -230,7 +237,7 @@ def main():
         return pred_has_gg5, gt_has_gg5, gg5_overlap
 
     def _gg5_overlap_only(selected_name: str) -> bool:
-        """Infer solo para saber si pred y GT comparten al menos un pixel GG5 (clase 3)."""
+        """Infer only para saber si pred y GT comparten al menos un pixel GG5 (clase 3)."""
         dataset = SICAPv2Dataset([selected_name], IMAGES_DIR, MASKS_DIR, transform=get_val_transforms())
         img_tensor, mask_tensor = dataset[0]
 
@@ -245,7 +252,7 @@ def main():
         return bool(pred_has_gg5 and gt_has_gg5)
 
     def _gg5_pred_only(selected_name: str) -> bool:
-        """Infer solo para saber si el modelo predice alguna vez GG5 (clase 3)."""
+        """Infer only para saber si el modelo predice alguna vez GG5 (clase 3)."""
         dataset = SICAPv2Dataset([selected_name], IMAGES_DIR, MASKS_DIR, transform=get_val_transforms())
         img_tensor, _ = dataset[0]
         with torch.no_grad():
@@ -279,7 +286,7 @@ def main():
     # If not found in repeat, do extra tries (only if requested)
     if args.find_gg5_correct and not gg5_saved:
         if out_dir is None:
-            raise ValueError("--find-gg5-correct requiere --out-dir para guardar la imagen encontrada.")
+            raise ValueError("--find-gg5-correct requiere --out-dir para saver la imagen encontrada.")
         for _ in range(args.gg5_max_tries):
             name = random.choice(val_names)
             overlap = _gg5_overlap_only(name)
@@ -290,7 +297,7 @@ def main():
                 gg5_saved = True
                 break
 
-    # Fallback: si no hay ejemplo que cumpla (pred y GT tienen GG5), al menos guarda uno donde predice GG5.
+    # Fallback: si no hay ejemplo que cumpla (pred y GT tienen GG5), al menos save uno donde predice GG5.
     if args.find_gg5_correct and not gg5_saved:
         pred_only_path = out_dir / "gg5_pred_only.png" if out_dir is not None else None
         if pred_only_path is not None:

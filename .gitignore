@@ -16,6 +16,7 @@ venv/
 wandb/
 checkpoints/
 checkpoints_*/
+artifacts/
 outputs/
 uni2_features/
 
@@ -35,3 +36,7 @@ temp_*.py
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Slurm job logs (templates keep empty slurm/logs/.gitkeep)
+slurm/logs/*.out
+slurm/logs/*.err

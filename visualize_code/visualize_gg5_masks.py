@@ -1,9 +1,9 @@
 """
-Visualiza imágenes de parches etiquetados como G5 en partition junto con:
-  - máscara en escala de grises (valores JPEG decodificados)
-  - máscara con clases tras _MASK_LUT (NC / GG3 / GG4 / GG5)
+Visualize images de parches etiquetados como G5 en partition junto con:
+  - mask en escala de grises (valores JPEG decodificados)
+  - mask con clases tras _MASK_LUT (NC / GG3 / GG4 / GG5)
 
-Uso:
+Usage:
   python visualize_gg5_masks.py
   python visualize_gg5_masks.py --n 12 --seed 0 --out-dir visualizations_gg5
 """
@@ -11,7 +11,17 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from pathlib import Path
+
+_SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import sicap_imports  # noqa: F401
+
+from paths import IMAGES_DIR, MASKS_DIR, PARTITION_DIR
+from sicap_imports import REPO_ROOT
 
 import cv2
 import matplotlib.pyplot as plt
@@ -19,11 +29,7 @@ import matplotlib.patches as mpatches
 import numpy as np
 import openpyxl
 
-# No importar training_conch (pull de torch/smp); misma LUT y rutas
-BASE_DIR = Path(__file__).resolve().parent
-IMAGES_DIR = BASE_DIR / "images"
-MASKS_DIR = BASE_DIR / "masks"
-PARTITION_DIR = BASE_DIR / "partition"
+# Do not import training_conch (pull de torch/smp); misma LUT y rutas (paths.py para datos)
 
 CLASS_NAMES = ["NC", "GG3", "GG4", "GG5"]
 _MASK_LUT = np.zeros(256, dtype=np.int64)
@@ -108,11 +114,11 @@ def main() -> None:
     ap.add_argument(
         "--require-mapped-gg5",
         action="store_true",
-        help="Solo parches donde la máscara LUT tenga al menos un píxel clase GG5 (3)",
+        help="Solo parches donde la mask LUT tenga al menos un pixel clase GG5 (3)",
     )
     args = ap.parse_args()
 
-    out_dir = BASE_DIR / args.out_dir
+    out_dir = REPO_ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_g5 = load_g5_image_names()
@@ -160,7 +166,7 @@ def main() -> None:
         mapped = lut[raw]
         colored = colorize_mapped(mapped)
 
-        # Fracción de píxeles por clase (información en título)
+        # Fracción de pixeles por clase (información en título)
         bc = np.bincount(mapped.ravel().astype(np.int64), minlength=4)
         tot = float(mapped.size)
         frac = [100.0 * bc[i] / tot for i in range(4)]
@@ -207,7 +213,7 @@ def main() -> None:
     plt.close()
     print(f"Guardado: {out_png}")
 
-    # Segunda figura: mosaico solo RGB + máscara mapeada (más legible en informe)
+    # Segunda figura: mosaico only RGB + mask mapeada (más legible en informe)
     n_side = int(np.ceil(np.sqrt(len(picked))))
     fig2, axes2 = plt.subplots(n_side, n_side * 2, figsize=(3.2 * n_side * 2, 3 * n_side))
     if n_side == 1:
@@ -232,7 +238,7 @@ def main() -> None:
             axes2[i, j * 2].axis("off")
             axes2[i, j * 2 + 1].imshow(colored)
             axes2[i, j * 2 + 1].axis("off")
-    plt.suptitle("G5 (partition): imagen | máscara LUT", fontsize=11)
+    plt.suptitle("G5 (partition): imagen | mask LUT", fontsize=11)
     plt.tight_layout()
     out2 = out_dir / "gg5_grid_compact.png"
     fig2.savefig(out2, dpi=140, bbox_inches="tight")
