@@ -37,6 +37,8 @@ DEFAULT_SEED = 42
 WANDB_PROJECT_DEFAULT = "SICAPv2_CONCH_hierarchical"
 
 OUTPUT_DIR = default_checkpoint_dir("checkpoints_conch_hierarchical")
+# Default folder for `training_conch_binary.py` checkpoints (best_{ValN}_*.pth).
+STAGE1_BINARY_CKPT_DIR_DEFAULT = default_checkpoint_dir("checkpoints_conch_binary")
 
 IMG_SIZE = 512
 CLASS_NAMES_4 = ["NC", "GG3", "GG4", "GG5"]
@@ -101,6 +103,10 @@ DEFAULT_CONFIG = {
     "stage2_rescue_threshold": 0.70,
     "stage2_keep_tumor_outside_gate": False,
     "binary_threshold_candidates": [round(x, 2) for x in np.linspace(0.1, 0.9, 17)],
+    # If set, skip Stage1 training and load best_{fold}_*.pth from this dir (binary script).
+    "stage1_external_ckpt_dir": None,
+    "stage1_external_threshold": None,  # if set, use as gate threshold; else val threshold search
+    "stage1_decoder_dropout_for_external": 0.0,  # must match training_conch_binary (no FPN dropout)
 }
 
 _MASK_LUT = np.zeros(256, dtype=np.int64)
@@ -708,6 +714,132 @@ def validate_binary_with_threshold_search(model, loader, criterion, device, thre
     return total_loss / max(num_batches, 1), {"cms_by_threshold": cms}
 
 
+def find_best_external_stage1_checkpoint(ckpt_dir: Path, fold_name: str) -> Path | None:
+    """Pick highest macro-F1 in filename from training_conch_binary (`best_Val1_*.pth`) or hierarchical (`best_stage1_Val1_*.pth`)."""
+    candidates: list[tuple[float, Path]] = []
+    for pat in (f"best_{fold_name}_*.pth", f"best_stage1_{fold_name}_*.pth"):
+        for p in ckpt_dir.glob(pat):
+            stem = p.stem
+            try:
+                if stem.startswith("best_stage1_"):
+                    parts = stem.split("_")
+                    score = float(parts[3])
+                else:
+                    score = float(stem.split("_")[-1])
+            except (IndexError, ValueError):
+                continue
+            candidates.append((score, p))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: x[0])[1]
+
+
+@torch.no_grad()
+def accumulate_binary_cm_at_threshold(model, loader, device: torch.device, threshold: float) -> np.ndarray:
+    """Single-threshold confusion matrix on binary val (for external thresholds not on the search grid)."""
+    model.eval()
+    cm = np.zeros((2, 2), dtype=np.int64)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    for images, masks in tqdm(loader, desc="  ValS1fix", leave=False):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True).long()
+        with autocast("cuda", enabled=(device.type == "cuda"), dtype=amp_dtype):
+            logits = model(images)
+        probs = torch.softmax(logits.float(), dim=1)[:, 1]
+        pred = (probs >= float(threshold)).long()
+        flat_p = pred.reshape(-1).cpu().numpy()
+        flat_t = masks.reshape(-1).cpu().numpy()
+        np.add.at(cm, (flat_t, flat_p), 1)
+    return cm
+
+
+def load_stage1_from_external_binary(
+    fold_name: str,
+    config: dict,
+    device: torch.device,
+    use_wandb: bool,
+) -> dict:
+    """
+    Load best checkpoint from training_conch_binary (same CONCH+FPN, 2 classes).
+    Decoder dropout must match the binary script (0): hierarchical uses optional Dropout in FPN head.
+    Threshold: optional fixed `--stage1-external-threshold`, else same policy as trained Stage1 on val.
+    """
+    ckpt_dir = Path(config["stage1_external_ckpt_dir"]).resolve()
+    ckpt_path = find_best_external_stage1_checkpoint(ckpt_dir, fold_name)
+    if ckpt_path is None:
+        raise FileNotFoundError(
+            f"No checkpoint matching best_{fold_name}_*.pth or best_stage1_{fold_name}_*.pth in {ckpt_dir}"
+        )
+    print(f"  [Stage1 External] Using binary checkpoint: {ckpt_path.name}")
+    drop_s1 = float(config.get("stage1_decoder_dropout_for_external", 0.0))
+    s1_cfg = {**config, "decoder_dropout": drop_s1}
+    model = build_model(s1_cfg, num_classes=NUM_CLASSES_STAGE1).to(device)
+    state = torch.load(ckpt_path, map_location=device)
+    r = model.load_state_dict(state, strict=False)
+    if r and (r.missing_keys or r.unexpected_keys):
+        print(
+            f"  [WARN] Stage1 load strict=False missing={len(r.missing_keys)} unexpected={len(r.unexpected_keys)}"
+        )
+    train_loader, val_loader = get_fold_dataloaders(fold_name, config, binary=True)
+    criterion = GuidedLoss(
+        num_classes=NUM_CLASSES_STAGE1,
+        class_weights=config["class_weights_stage1"],
+        dice_weight=config["dice_weight_stage1"],
+        ce_weight=config["ce_weight_stage1"],
+    ).to(device)
+    thresholds = [float(x) for x in config.get("binary_threshold_candidates", [0.5])]
+    val_loss, val_bin = validate_binary_with_threshold_search(model, val_loader, criterion, device, thresholds)
+
+    ext_th = config.get("stage1_external_threshold")
+    if ext_th is not None:
+        th = float(ext_th)
+        cms = val_bin["cms_by_threshold"]
+        cm = None
+        for k in cms:
+            if abs(float(k) - float(th)) < 1e-6:
+                cm = cms[k]
+                break
+        if cm is None:
+            cm = accumulate_binary_cm_at_threshold(model, val_loader, device, th)
+        stats = compute_binary_stats_from_cm(cm)
+        stats["confusion_matrix"] = cm
+        sel = stats
+        macro_f1 = float(sel["macro_f1"])
+    else:
+        th, sel = select_stage1_threshold(
+            val_bin["cms_by_threshold"],
+            policy=config.get("stage1_threshold_policy", "macro_f1"),
+            min_cancer_recall=float(config.get("stage1_min_cancer_recall", 0.95)),
+        )
+        macro_f1 = float(sel["macro_f1"])
+        cm = sel["confusion_matrix"]
+
+    print(
+        f"  [Stage1 External] threshold={th:.4f} | macro-F1={macro_f1:.4f} | "
+        f"cancer_recall={sel['cancer_recall']:.4f} | cancer_precision={sel['cancer_precision']:.4f}"
+    )
+    if use_wandb and wandb.run is not None:
+        wandb.log({
+            f"{fold_name}/s1_external_path": str(ckpt_path),
+            f"{fold_name}/s1_external_macro_f1": float(macro_f1),
+            f"{fold_name}/s1_external_threshold": float(th),
+            f"{fold_name}/s1_external_cancer_recall": float(sel["cancer_recall"]),
+            f"{fold_name}/s1_external_cancer_precision": float(sel["cancer_precision"]),
+        })
+
+    return {
+        "fold": fold_name,
+        "macro_f1": macro_f1,
+        "threshold": float(th),
+        "cm": cm,
+        "path": ckpt_path,
+        "stats": {k: v for k, v in sel.items() if k != "confusion_matrix"},
+        "decoder_dropout_override": drop_s1,
+        "from_external_binary": True,
+        "val_loss_external": float(val_loss),
+    }
+
+
 @torch.no_grad()
 def validate_cascade(
     stage1_model,
@@ -759,8 +891,12 @@ def train_fold_stage1(
     use_wandb: bool = True,
 ):
     print(f"\n{'='*60}\n  FOLD {fold_name} | STAGE 1 (Binary)\n{'='*60}")
-    
-    # --- AUTO-RESUME ---
+
+    ext_dir = config.get("stage1_external_ckpt_dir")
+    if ext_dir:
+        return load_stage1_from_external_binary(fold_name, config, device, use_wandb)
+
+    # --- AUTO-RESUME (checkpoints written by this script: best_stage1_{fold}_*.pth) ---
     out_dir = Path(config.get("output_dir", OUTPUT_DIR))
     existing_ckpts = list(out_dir.glob(f"best_stage1_{fold_name}_*.pth"))
     if existing_ckpts:
@@ -770,7 +906,16 @@ def train_fold_stage1(
         threshold = float(parts[4].replace("th", ""))
         print(f"  [Auto-Resume] Found existing Stage 1 checkpoint: {best_ckpt.name}")
         print(f"  [Auto-Resume] Skipping Stage 1 training (Macro-F1: {macro_f1}, Threshold: {threshold})")
-        return {"fold": fold_name, "macro_f1": macro_f1, "threshold": threshold, "cm": None, "path": best_ckpt, "stats": None}
+        return {
+            "fold": fold_name,
+            "macro_f1": macro_f1,
+            "threshold": threshold,
+            "cm": None,
+            "path": best_ckpt,
+            "stats": None,
+            "decoder_dropout_override": None,
+            "from_external_binary": False,
+        }
     # -------------------
     train_loader, val_loader = get_fold_dataloaders(fold_name, config, binary=True)
     model = build_model(config, num_classes=NUM_CLASSES_STAGE1).to(device)
@@ -873,7 +1018,7 @@ def train_fold_stage1(
             torch.save(_trainable_model(model).state_dict(), best_path)
             best["path"] = best_path
             patience = 0
-            print("  [S1] ✓ checkpoint savedo")
+            print("  [S1] ✓ checkpoint saved")
         else:
             patience += 1
             if patience >= patience_max:
@@ -881,6 +1026,8 @@ def train_fold_stage1(
                 break
         if dry_run:
             break
+    best.setdefault("decoder_dropout_override", None)
+    best.setdefault("from_external_binary", False)
     return best
 
 
@@ -890,13 +1037,17 @@ def train_fold_stage2(
     device: torch.device,
     stage1_path: Path,
     stage1_threshold: float,
+    stage1_decoder_dropout_override: float | None = None,
     dry_run: bool = False,
     use_wandb: bool = True,
 ):
     print(f"\n{'='*60}\n  FOLD {fold_name} | STAGE 2 (4-class)\n{'='*60}")
     train_loader, val_loader = get_fold_dataloaders(fold_name, config, binary=False)
     model = build_model(config, num_classes=NUM_CLASSES_STAGE2).to(device)
-    stage1_model = build_model(config, num_classes=NUM_CLASSES_STAGE1).to(device)
+    s1_cfg = {**config}
+    if stage1_decoder_dropout_override is not None:
+        s1_cfg["decoder_dropout"] = float(stage1_decoder_dropout_override)
+    stage1_model = build_model(s1_cfg, num_classes=NUM_CLASSES_STAGE1).to(device)
     stage1_model.load_state_dict(torch.load(stage1_path, map_location=device))
     stage1_model.eval()
     for p in stage1_model.parameters():
@@ -1030,9 +1181,20 @@ def train_fold_stage2(
     return best
 
 
-def evaluate_fold_hierarchical(fold_name: str, config: dict, device: torch.device, stage1_path: Path, stage2_path: Path, stage1_threshold: float):
+def evaluate_fold_hierarchical(
+    fold_name: str,
+    config: dict,
+    device: torch.device,
+    stage1_path: Path,
+    stage2_path: Path,
+    stage1_threshold: float,
+    stage1_decoder_dropout_override: float | None = None,
+):
     _, val_loader_stage2 = get_fold_dataloaders(fold_name, config, binary=False)
-    model1 = build_model(config, num_classes=NUM_CLASSES_STAGE1).to(device)
+    s1_cfg = {**config}
+    if stage1_decoder_dropout_override is not None:
+        s1_cfg["decoder_dropout"] = float(stage1_decoder_dropout_override)
+    model1 = build_model(s1_cfg, num_classes=NUM_CLASSES_STAGE1).to(device)
     model2 = build_model(config, num_classes=NUM_CLASSES_STAGE2).to(device)
     model1.load_state_dict(torch.load(stage1_path, map_location=device))
     model2.load_state_dict(torch.load(stage2_path, map_location=device))
@@ -1148,6 +1310,32 @@ def main():
         default=None,
         help="Gate dilation kernel during hierarchical inference.",
     )
+    parser.add_argument(
+        "--stage1-external-ckpt-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Folder with training_conch_binary checkpoints (best_ValN_*.pth). "
+            "Skips Stage 1 training and loads best macro-F1 file per fold. "
+            f"Default artifact folder: {STAGE1_BINARY_CKPT_DIR_DEFAULT}"
+        ),
+    )
+    parser.add_argument(
+        "--stage1-external-threshold",
+        type=float,
+        default=None,
+        metavar="T",
+        help=(
+            "Probability threshold for Stage 1 gate when using external binary ckpt. "
+            "If omitted, runs the same val threshold search as training (see --stage1-threshold-policy)."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-use-binary-artifacts",
+        action="store_true",
+        help=f"Shorthand: load Stage 1 from {STAGE1_BINARY_CKPT_DIR_DEFAULT} (training_conch_binary).",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -1212,6 +1400,14 @@ def main():
         config["stage2_rescue_threshold"] = float(args.stage2_rescue_threshold)
     if args.stage1_infer_gate_dilation is not None:
         config["stage1_infer_gate_dilation"] = max(0, int(args.stage1_infer_gate_dilation))
+    if args.stage1_external_ckpt_dir:
+        config["stage1_external_ckpt_dir"] = str(Path(args.stage1_external_ckpt_dir).resolve())
+    elif args.stage1_use_binary_artifacts:
+        config["stage1_external_ckpt_dir"] = str(STAGE1_BINARY_CKPT_DIR_DEFAULT.resolve())
+    elif args.stage1_external_threshold is not None:
+        print("  [WARN] --stage1-external-threshold without external ckpt dir: ignored.")
+    if args.stage1_external_threshold is not None:
+        config["stage1_external_threshold"] = float(args.stage1_external_threshold)
     config["output_dir"] = Path(args.output_dir).resolve() if args.output_dir else OUTPUT_DIR
 
     print(f"Checkpoints -> {config['output_dir']}")
@@ -1248,6 +1444,9 @@ def main():
         f"enable_stage2_rescue={config.get('enable_stage2_rescue')} | "
         f"stage2_rescue_threshold={config.get('stage2_rescue_threshold')}"
     )
+    if config.get("stage1_external_ckpt_dir"):
+        print(f"  stage1_external_ckpt_dir={config['stage1_external_ckpt_dir']} (Stage 1 train skipped)")
+        print(f"  stage1_decoder_dropout_for_external={config.get('stage1_decoder_dropout_for_external')}")
 
     use_wandb = not args.no_wandb
     if use_wandb and not args.dry_run:
@@ -1286,6 +1485,8 @@ def main():
                     "stage1_infer_gate_dilation": config.get("stage1_infer_gate_dilation"),
                     "enable_stage2_rescue": config.get("enable_stage2_rescue"),
                     "stage2_rescue_threshold": config.get("stage2_rescue_threshold"),
+                    "stage1_external_ckpt_dir": config.get("stage1_external_ckpt_dir"),
+                    "stage1_external_threshold": config.get("stage1_external_threshold"),
                     "fold": args.fold,
                 },
                 tags=["CONCH", "SICAPv2", "hierarchical"],
@@ -1309,6 +1510,7 @@ def main():
             device=device,
             stage1_path=s1["path"],
             stage1_threshold=float(s1["threshold"]),
+            stage1_decoder_dropout_override=s1.get("decoder_dropout_override"),
             dry_run=args.dry_run,
             use_wandb=use_wandb,
         )
@@ -1317,7 +1519,15 @@ def main():
         if s1["path"] is None or s2["path"] is None:
             print(f"  [WARN] Fold {fold}: faltan checkpoints para evaluar cascada.")
             continue
-        h = evaluate_fold_hierarchical(fold, config, device, s1["path"], s2["path"], float(s1["threshold"]))
+        h = evaluate_fold_hierarchical(
+            fold,
+            config,
+            device,
+            s1["path"],
+            s2["path"],
+            float(s1["threshold"]),
+            stage1_decoder_dropout_override=s1.get("decoder_dropout_override"),
+        )
         aggregated_hier_cm += h["confusion_matrix"]
         print(f"\n  [Fold {fold}] S1 best macro-F1={s1['macro_f1']:.4f} @th={s1['threshold']:.2f}")
         if s1.get("stats") is not None:

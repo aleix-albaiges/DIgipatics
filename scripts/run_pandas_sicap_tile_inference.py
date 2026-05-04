@@ -18,6 +18,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SRC_DIR = REPO_ROOT / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from inspect_pandas_masks import (  # type: ignore
     SICAP_CLASS_NAMES,
@@ -34,7 +37,10 @@ from inspect_pandas_masks import (  # type: ignore
     summarize_mask,
     get_tiff_structure,
 )
-from training_conch_final import CONCHSegModel
+try:
+    from training_conch_final import CONCHSegModel
+except ModuleNotFoundError:
+    from training_conchv2 import CONCHSegModel
 
 LOGGER = logging.getLogger("run_pandas_sicap_tile_inference")
 MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
@@ -42,6 +48,7 @@ STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
 CLASS_NAMES = [SICAP_CLASS_NAMES[idx] for idx in range(4)]
 RADBOUD_TO_SICAP = {0: 0, 1: 0, 2: 0, 3: 1, 4: 2, 5: 3}
 KAROLINSKA_TO_SICAP = {0: 0, 1: 0, 2: 0}
+BINARY_CLASS_NAMES = ["NC", "Cancer"]
 
 
 @dataclass
@@ -93,6 +100,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tiles-per-case", type=int, default=12)
     parser.add_argument("--tile-size", type=int, default=512)
     parser.add_argument("--stride", type=int, default=512)
+    parser.add_argument(
+        "--blend-mode",
+        type=str,
+        default="gaussian_sum",
+        choices=("gaussian_sum", "overwrite"),
+        help="How to merge overlapped tiles in WSI mosaic.",
+    )
+    parser.add_argument(
+        "--gaussian-sigma-scale",
+        type=float,
+        default=4.0,
+        help="Gaussian sigma = tile_size / gaussian_sigma_scale (only gaussian_sum).",
+    )
     parser.add_argument("--target-magnification", type=float, default=10.0)
     parser.add_argument("--source-magnification", type=float, default=40.0)
     parser.add_argument("--device", type=str, default="cuda")
@@ -100,6 +120,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thumb-size", type=int, default=1024)
     parser.add_argument("--tissue-threshold", type=float, default=0.15)
     parser.add_argument("--min-tumor-fraction", type=float, default=0.01)
+    parser.add_argument(
+        "--binary-cancer-mode",
+        action="store_true",
+        help="Binary mode: NC vs Cancer. GT cancer is derived from Gleason labels.",
+    )
     parser.add_argument("--allow-karolinska", action="store_true")
     parser.add_argument("--log-level", type=str, default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
@@ -135,9 +160,9 @@ def load_checkpoint_row(csv_path: Path, fold: Optional[str]) -> Tuple[Dict[str, 
     return row.to_dict(), checkpoint_path
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
+def load_model(checkpoint_path: Path, device: torch.device, num_classes: int) -> torch.nn.Module:
     LOGGER.info("Loading checkpoint %s", checkpoint_path)
-    model = CONCHSegModel(num_classes=4, unfreeze_last=0)
+    model = CONCHSegModel(num_classes=num_classes, unfreeze_last=0)
     state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
     model.to(device)
@@ -280,6 +305,19 @@ def remap_pandas_mask_to_sicap(mask: np.ndarray, pandas_to_sicap: Dict[int, int]
     return remapped
 
 
+def remap_pandas_mask_to_binary(mask: np.ndarray, schema_name: str) -> np.ndarray:
+    """
+    Binary target from WSI mask:
+    - radboud_pattern_mask: cancer if Gleason pattern label is 3/4/5
+    - karolinska_binary_mask: no Gleason-by-pixel available -> all NC
+    """
+    label_ids = extract_label_ids(mask)
+    out = np.zeros(label_ids.shape, dtype=np.uint8)
+    if schema_name == "radboud_pattern_mask":
+        out[(label_ids == 3) | (label_ids == 4) | (label_ids == 5)] = 1
+    return out
+
+
 def compute_tissue_fraction(image: np.ndarray) -> float:
     image_f = image.astype(np.float32)
     gray = 0.299 * image_f[..., 0] + 0.587 * image_f[..., 1] + 0.114 * image_f[..., 2]
@@ -325,6 +363,15 @@ def preprocess_tile(tile_rgb: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(image).float()
 
 
+def create_gaussian_kernel(size: int, sigma_scale: float = 4.0) -> np.ndarray:
+    sigma = float(size) / max(float(sigma_scale), 1e-6)
+    coords = np.arange(size, dtype=np.float32) - (size - 1) / 2.0
+    g1d = np.exp(-(coords**2) / (2.0 * sigma**2))
+    kernel = np.outer(g1d, g1d).astype(np.float32)
+    kernel /= max(float(kernel.max()), 1e-8)
+    return kernel
+
+
 def confusion_matrix(pred: np.ndarray, target: np.ndarray, num_classes: int = 4) -> np.ndarray:
     valid = (target >= 0) & (target < num_classes)
     matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -332,12 +379,12 @@ def confusion_matrix(pred: np.ndarray, target: np.ndarray, num_classes: int = 4)
     return matrix
 
 
-def metrics_from_confusion(cm: np.ndarray) -> Dict[str, object]:
+def metrics_from_confusion(cm: np.ndarray, class_names: Sequence[str]) -> Dict[str, object]:
     total = cm.sum()
     acc = float(np.trace(cm) / total) if total > 0 else 0.0
     dice_per_class: Dict[str, float] = {}
     iou_per_class: Dict[str, float] = {}
-    for idx, name in enumerate(CLASS_NAMES):
+    for idx, name in enumerate(class_names):
         tp = cm[idx, idx]
         fp = cm[:, idx].sum() - tp
         fn = cm[idx, :].sum() - tp
@@ -373,7 +420,8 @@ def save_tile_visuals(case_dir: Path, image_tile: np.ndarray, gt_mask: np.ndarra
     from PIL import Image
     import matplotlib.pyplot as plt
 
-    palette = build_color_palette(np.asarray([0, 1, 2, 3], dtype=np.int64))
+    classes_present = np.unique(np.concatenate([gt_mask.reshape(-1), pred_mask.reshape(-1)]))
+    palette = build_color_palette(classes_present.astype(np.int64))
     gt_rgb = colorize_mask(gt_mask, palette)
     pred_rgb = colorize_mask(pred_mask, palette)
     err_mask = (gt_mask != pred_mask).astype(np.uint8)
@@ -413,10 +461,19 @@ def save_tile_visuals(case_dir: Path, image_tile: np.ndarray, gt_mask: np.ndarra
     }
 
 
-def save_case_overview(case_dir: Path, image: np.ndarray, mask: np.ndarray, pred_tiles: Sequence[TileRecord], thumb_size: int) -> None:
+def save_case_overview(
+    case_dir: Path,
+    image: np.ndarray,
+    mask: np.ndarray,
+    pred_tiles: Sequence[TileRecord],
+    thumb_size: int,
+    pred_canvas: Optional[np.ndarray] = None,
+    gt_canvas: Optional[np.ndarray] = None,
+    coverage: Optional[np.ndarray] = None,
+) -> None:
     from PIL import Image
 
-    palette = build_color_palette(np.asarray([0, 1, 2, 3], dtype=np.int64))
+    palette = build_color_palette(np.unique(np.concatenate([mask.reshape(-1), pred_canvas.reshape(-1)])).astype(np.int64) if pred_canvas is not None else np.unique(mask).astype(np.int64))
     image_thumb = resize_image(image, thumb_size, is_mask=False)
     mask_thumb = resize_image(mask, thumb_size, is_mask=True)
     mask_rgb = colorize_mask(mask_thumb, palette)
@@ -424,18 +481,19 @@ def save_case_overview(case_dir: Path, image: np.ndarray, mask: np.ndarray, pred
     Image.fromarray(mask_rgb).save(case_dir / "case_gt_mask.png")
     Image.fromarray(overlay(image_thumb, mask_rgb)).save(case_dir / "case_gt_overlay.png")
 
-    # Reconstruct una vista global de predicción uniendo todos los tiles seleccionados.
-    h, w = mask.shape
-    pred_canvas = np.zeros((h, w), dtype=np.uint8)
-    gt_canvas = np.zeros((h, w), dtype=np.uint8)
-    coverage = np.zeros((h, w), dtype=np.uint8)
-    for tile in pred_tiles:
-        th, tw = tile.pred_mask.shape
-        y0, x0 = tile.y, tile.x
-        y1, x1 = min(y0 + th, h), min(x0 + tw, w)
-        pred_canvas[y0:y1, x0:x1] = tile.pred_mask[: y1 - y0, : x1 - x0]
-        gt_canvas[y0:y1, x0:x1] = tile.gt_mask[: y1 - y0, : x1 - x0]
-        coverage[y0:y1, x0:x1] = 255
+    # If not provided, fallback to overwrite stitching from per-tile predictions.
+    if pred_canvas is None or gt_canvas is None or coverage is None:
+        h, w = mask.shape
+        pred_canvas = np.zeros((h, w), dtype=np.uint8)
+        gt_canvas = np.zeros((h, w), dtype=np.uint8)
+        coverage = np.zeros((h, w), dtype=np.uint8)
+        for tile in pred_tiles:
+            th, tw = tile.pred_mask.shape
+            y0, x0 = tile.y, tile.x
+            y1, x1 = min(y0 + th, h), min(x0 + tw, w)
+            pred_canvas[y0:y1, x0:x1] = tile.pred_mask[: y1 - y0, : x1 - x0]
+            gt_canvas[y0:y1, x0:x1] = tile.gt_mask[: y1 - y0, : x1 - x0]
+            coverage[y0:y1, x0:x1] = 255
 
     np.save(case_dir / "case_pred_mask_mosaic_class.npy", pred_canvas)
     np.save(case_dir / "case_gt_mask_mosaic_class.npy", gt_canvas)
@@ -480,6 +538,11 @@ def run_case(
     tissue_threshold: float,
     min_tumor_fraction: float,
     thumb_size: int,
+    blend_mode: str,
+    gaussian_sigma_scale: float,
+    num_classes: int,
+    class_names: Sequence[str],
+    binary_cancer_mode: bool,
 ) -> Dict[str, object]:
     level_index, effective_mag = choose_level_for_magnification(case.wsi_structure, source_magnification, target_magnification)
     LOGGER.info("Case %s -> level %s (effective %.2fx)", case.case_id, level_index, effective_mag)
@@ -497,7 +560,10 @@ def run_case(
         mask = np.moveaxis(mask, 0, -1)
     if mask.ndim == 3 and mask.shape[-1] == 1:
         mask = mask[..., 0]
-    mapped_mask = remap_pandas_mask_to_sicap(mask, case.pandas_to_sicap)
+    if binary_cancer_mode:
+        mapped_mask = remap_pandas_mask_to_binary(mask, case.schema_name)
+    else:
+        mapped_mask = remap_pandas_mask_to_sicap(mask, case.pandas_to_sicap)
 
     tiles = enumerate_tiles(
         image=wsi,
@@ -510,54 +576,105 @@ def run_case(
     if not tiles:
         raise RuntimeError(f"No valid tiles found for case {case.case_id} at level {level_index}")
 
-    predictions = batched_inference(model, [tile["image"] for tile in tiles], device=device, batch_size=batch_size)
     case_dir = output_dir / case.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
 
     tile_rows: List[Dict[str, object]] = []
-    aggregate_cm = np.zeros((4, 4), dtype=np.int64)
+    aggregate_cm = np.zeros((num_classes, num_classes), dtype=np.int64)
     tile_records: List[TileRecord] = []
-    for idx, (tile, pred_mask) in enumerate(zip(tiles, predictions)):
-        gt_mask = tile["mask"].astype(np.uint8)
-        cm = confusion_matrix(pred_mask, gt_mask, num_classes=4)
-        metrics = metrics_from_confusion(cm)
-        aggregate_cm += cm
-        tile_name = f"tile_{idx:03d}_x{tile['x']}_y{tile['y']}"
-        paths = save_tile_visuals(case_dir, tile["image"], gt_mask, pred_mask, tile_name)
-        row = {
-            "case_id": case.case_id,
-            "tile_index": idx,
-            "x": int(tile["x"]),
-            "y": int(tile["y"]),
-            "level_index": level_index,
-            "effective_magnification": effective_mag,
-            "tumor_fraction": float(tile["tumor_fraction"]),
-            "tissue_fraction": float(tile["tissue_fraction"]),
-            **{f"dice_{name}": metrics["dice_per_class"][name] for name in CLASS_NAMES},
-            **{f"iou_{name}": metrics["iou_per_class"][name] for name in CLASS_NAMES},
-            "pixel_accuracy": metrics["pixel_accuracy"],
-            "macro_dice": metrics["macro_dice"],
-            "macro_iou": metrics["macro_iou"],
-            **paths,
-        }
-        tile_rows.append(row)
-        tile_records.append(
-            TileRecord(
-                tile_index=idx,
-                x=int(tile["x"]),
-                y=int(tile["y"]),
-                level_index=level_index,
-                tumor_fraction=float(tile["tumor_fraction"]),
-                tissue_fraction=float(tile["tissue_fraction"]),
-                metrics=metrics,
-                gt_mask=gt_mask.copy(),
-                pred_mask=pred_mask.copy(),
-            )
-        )
+    h, w = mapped_mask.shape
+    pred_canvas = np.zeros((h, w), dtype=np.uint8)
+    gt_canvas = np.zeros((h, w), dtype=np.uint8)
+    coverage = np.zeros((h, w), dtype=np.uint8)
+
+    effective_blend_mode = blend_mode
+    if stride >= tile_size and blend_mode == "gaussian_sum":
+        effective_blend_mode = "overwrite"
+    if effective_blend_mode == "gaussian_sum":
+        prob_accumulator = np.zeros((num_classes, h, w), dtype=np.float32)
+        weight_accumulator = np.zeros((h, w), dtype=np.float32)
+        gaussian_kernel = create_gaussian_kernel(tile_size, sigma_scale=gaussian_sigma_scale)
+
+    with torch.inference_mode():
+        for start in range(0, len(tiles), batch_size):
+            batch_tiles = tiles[start : start + batch_size]
+            batch_tensor = torch.stack([preprocess_tile(t["image"]) for t in batch_tiles]).to(device, non_blocking=True)
+            logits = model(batch_tensor)
+            probs = torch.softmax(logits, dim=1).cpu().numpy().astype(np.float32)  # [B, C, H, W]
+            preds = probs.argmax(axis=1).astype(np.uint8)  # [B, H, W]
+
+            for b_idx, tile in enumerate(batch_tiles):
+                idx = start + b_idx
+                pred_mask = preds[b_idx]
+                gt_mask = tile["mask"].astype(np.uint8)
+                y0 = int(tile["y"])
+                x0 = int(tile["x"])
+                y1 = min(y0 + tile_size, h)
+                x1 = min(x0 + tile_size, w)
+                ph, pw = (y1 - y0), (x1 - x0)
+                coverage[y0:y1, x0:x1] = 255
+                gt_canvas[y0:y1, x0:x1] = gt_mask[:ph, :pw]
+
+                if effective_blend_mode == "gaussian_sum":
+                    kernel_slice = gaussian_kernel[:ph, :pw]
+                    prob_accumulator[:, y0:y1, x0:x1] += probs[b_idx, :, :ph, :pw] * kernel_slice[None, :, :]
+                    weight_accumulator[y0:y1, x0:x1] += kernel_slice
+                else:
+                    pred_canvas[y0:y1, x0:x1] = pred_mask[:ph, :pw]
+
+                cm = confusion_matrix(pred_mask, gt_mask, num_classes=num_classes)
+                metrics = metrics_from_confusion(cm, class_names=class_names)
+                aggregate_cm += cm
+                tile_name = f"tile_{idx:03d}_x{tile['x']}_y{tile['y']}"
+                paths = save_tile_visuals(case_dir, tile["image"], gt_mask, pred_mask, tile_name)
+                row = {
+                    "case_id": case.case_id,
+                    "tile_index": idx,
+                    "x": int(tile["x"]),
+                    "y": int(tile["y"]),
+                    "level_index": level_index,
+                    "effective_magnification": effective_mag,
+                    "tumor_fraction": float(tile["tumor_fraction"]),
+                    "tissue_fraction": float(tile["tissue_fraction"]),
+                    **{f"dice_{name}": metrics["dice_per_class"][name] for name in class_names},
+                    **{f"iou_{name}": metrics["iou_per_class"][name] for name in class_names},
+                    "pixel_accuracy": metrics["pixel_accuracy"],
+                    "macro_dice": metrics["macro_dice"],
+                    "macro_iou": metrics["macro_iou"],
+                    **paths,
+                }
+                tile_rows.append(row)
+                tile_records.append(
+                    TileRecord(
+                        tile_index=idx,
+                        x=int(tile["x"]),
+                        y=int(tile["y"]),
+                        level_index=level_index,
+                        tumor_fraction=float(tile["tumor_fraction"]),
+                        tissue_fraction=float(tile["tissue_fraction"]),
+                        metrics=metrics,
+                        gt_mask=gt_mask.copy(),
+                        pred_mask=pred_mask.copy(),
+                    )
+                )
+
+    if effective_blend_mode == "gaussian_sum":
+        norm = np.clip(weight_accumulator, 1e-8, None)
+        pred_canvas = (prob_accumulator / norm[None, :, :]).argmax(axis=0).astype(np.uint8)
+        pred_canvas[coverage == 0] = 0
 
     pd.DataFrame(tile_rows).to_csv(case_dir / "tile_metrics.csv", index=False)
-    aggregate_metrics = metrics_from_confusion(aggregate_cm)
-    save_case_overview(case_dir, wsi, mapped_mask, tile_records, thumb_size=thumb_size)
+    aggregate_metrics = metrics_from_confusion(aggregate_cm, class_names=class_names)
+    save_case_overview(
+        case_dir,
+        wsi,
+        mapped_mask,
+        tile_records,
+        thumb_size=thumb_size,
+        pred_canvas=pred_canvas,
+        gt_canvas=gt_canvas,
+        coverage=coverage,
+    )
 
     summary = {
         "case_id": case.case_id,
@@ -565,10 +682,12 @@ def run_case(
         "isup_grade": case.isup_grade,
         "gleason_score": case.gleason_score,
         "schema_name": case.schema_name,
+        "binary_cancer_mode": bool(binary_cancer_mode),
         "observed_labels": case.observed_labels,
         "level_index": level_index,
         "effective_magnification": effective_mag,
         "num_tiles": len(tile_rows),
+        "blend_mode": effective_blend_mode,
         "aggregate_metrics": aggregate_metrics,
     }
     (case_dir / "case_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -598,7 +717,9 @@ def main() -> None:
         target_magnification=args.target_magnification,
         train_metadata=train_metadata,
     )
-    model = load_model(checkpoint_path, device=device)
+    num_classes = 2 if args.binary_cancer_mode else 4
+    class_names = BINARY_CLASS_NAMES if args.binary_cancer_mode else CLASS_NAMES
+    model = load_model(checkpoint_path, device=device, num_classes=num_classes)
 
     case_summaries: List[Dict[str, object]] = []
     for case in cases:
@@ -617,6 +738,11 @@ def main() -> None:
                 tissue_threshold=args.tissue_threshold,
                 min_tumor_fraction=args.min_tumor_fraction,
                 thumb_size=args.thumb_size,
+                blend_mode=args.blend_mode,
+                gaussian_sigma_scale=args.gaussian_sigma_scale,
+                num_classes=num_classes,
+                class_names=class_names,
+                binary_cancer_mode=args.binary_cancer_mode,
             )
             case_summaries.append(case_summary)
         except RuntimeError as exc:
