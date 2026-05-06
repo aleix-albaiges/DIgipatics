@@ -1,0 +1,136 @@
+{
+  "version": "0.7.0",
+  "createTimestamp": 1777986201152,
+  "modifyTimestamp": 1777986201152,
+  "uri": "file:/C:/Users/Aleix/OneDrive%20-%20Universitat%20Politècnica%20de%20Catalunya/Escritorio/UNI/TFG/Recerca%20primers%20datasets/SicapV2/SICAPv2/data/qupath_project/project.qpproj",
+  "lastID": 1,
+  "images": [
+    {
+      "serverBuilder": {
+        "builderType": "pyramidize",
+        "builder": {
+          "builderType": "uri",
+          "providerClassName": "qupath.lib.images.servers.bioformats.BioFormatsServerBuilder",
+          "uri": "file:/C:/Users/Aleix/OneDrive%20-%20Universitat%20Polit%C3%A8cnica%20de%20Catalunya/Escritorio/UNI/TFG/Recerca%20primers%20datasets/SicapV2/SICAPv2/PANDAS/00a7fb880dc12c5de82df39b30533da9.tiff",
+          "args": [
+            "--series",
+            "0"
+          ],
+          "metadata": {
+            "name": "00a7fb880dc12c5de82df39b30533da9.tiff",
+            "width": 32256,
+            "height": 4352,
+            "sizeZ": 1,
+            "sizeT": 1,
+            "channelType": "DEFAULT",
+            "isRGB": true,
+            "pixelType": "UINT8",
+            "levels": [
+              {
+                "downsample": 1.0,
+                "width": 32256,
+                "height": 4352
+              }
+            ],
+            "channels": [
+              {
+                "name": "Red",
+                "color": -65536
+              },
+              {
+                "name": "Green",
+                "color": -16711936
+              },
+              {
+                "name": "Blue",
+                "color": -16776961
+              }
+            ],
+            "pixelCalibration": {
+              "pixelWidth": {
+                "value": 0.4861876369654638,
+                "unit": "µm"
+              },
+              "pixelHeight": {
+                "value": 0.4861876369654638,
+                "unit": "µm"
+              },
+              "zSpacing": {
+                "value": 1.0,
+                "unit": "z-slice"
+              },
+              "timeUnit": "SECONDS",
+              "timepoints": []
+            },
+            "preferredTileWidth": 512,
+            "preferredTileHeight": 512
+          }
+        },
+        "metadata": {
+          "name": "00a7fb880dc12c5de82df39b30533da9.tiff",
+          "width": 32256,
+          "height": 4352,
+          "sizeZ": 1,
+          "sizeT": 1,
+          "channelType": "DEFAULT",
+          "isRGB": true,
+          "pixelType": "UINT8",
+          "levels": [
+            {
+              "downsample": 1.0,
+              "width": 32256,
+              "height": 4352
+            },
+            {
+              "downsample": 4.0,
+              "width": 8064,
+              "height": 1088
+            },
+            {
+              "downsample": 16.0,
+              "width": 2016,
+              "height": 272
+            }
+          ],
+          "channels": [
+            {
+              "name": "Red",
+              "color": -65536
+            },
+            {
+              "name": "Green",
+              "color": -16711936
+            },
+            {
+              "name": "Blue",
+              "color": -16776961
+            }
+          ],
+          "pixelCalibration": {
+            "pixelWidth": {
+              "value": 0.4861876369654638,
+              "unit": "µm"
+            },
+            "pixelHeight": {
+              "value": 0.4861876369654638,
+              "unit": "µm"
+            },
+            "zSpacing": {
+              "value": 1.0,
+              "unit": "z-slice"
+            },
+            "timeUnit": "SECONDS",
+            "timepoints": []
+          },
+          "preferredTileWidth": 512,
+          "preferredTileHeight": 512
+        }
+      },
+      "entryID": 1,
+      "randomizedName": "376af0fe-2127-4e4f-84be-8fb09f8a8c4d",
+      "imageName": "00a7fb880dc12c5de82df39b30533da9.tiff",
+      "metadata": {},
+      "tags": []
+    }
+  ]
+}

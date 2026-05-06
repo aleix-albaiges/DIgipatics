@@ -863,7 +863,7 @@ def main():
                 "sampler_weight_gg3": config.get("sampler_weight_gg3"),
                 "conch_checkpoint": config.get("conch_checkpoint") or CONCH_HF_CHECKPOINT,
                 "output_dir": str(config["output_dir"]),
-                "mask_lut": "43:85->GG3, 85:160->GG4, 160:255->GG5, else->NC",
+                "mask_lut": "25:75->GG3, 75:175->GG4, 175:255->GG5, else->NC",
                 "pixel_frac_partition": [float(x) for x in _PIXEL_FRAC_PARTITION],
                 "lr_plateau_patience": config.get("lr_plateau_patience", 3),
                 "seed": config.get("seed", DEFAULT_SEED),
