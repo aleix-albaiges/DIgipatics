@@ -3,7 +3,7 @@
   "createTimestamp": 1777986201152,
   "modifyTimestamp": 1777986201152,
   "uri": "file:/C:/Users/Aleix/OneDrive%20-%20Universitat%20Politècnica%20de%20Catalunya/Escritorio/UNI/TFG/Recerca%20primers%20datasets/SicapV2/SICAPv2/data/qupath_project/project.qpproj",
-  "lastID": 1,
+  "lastID": 6,
   "images": [
     {
       "serverBuilder": {
@@ -127,8 +127,384 @@
         }
       },
       "entryID": 1,
-      "randomizedName": "376af0fe-2127-4e4f-84be-8fb09f8a8c4d",
+      "randomizedName": "7d1750d0-6501-4186-a8db-2c235085f9f9",
       "imageName": "00a7fb880dc12c5de82df39b30533da9.tiff",
+      "metadata": {},
+      "tags": []
+    },
+    {
+      "serverBuilder": {
+        "builderType": "pyramidize",
+        "builder": {
+          "builderType": "uri",
+          "providerClassName": "qupath.lib.images.servers.bioformats.BioFormatsServerBuilder",
+          "uri": "file:/C:/Users/Aleix/OneDrive%20-%20Universitat%20Polit%C3%A8cnica%20de%20Catalunya/Escritorio/UNI/TFG/Recerca%20primers%20datasets/SicapV2/SICAPv2/PANDAS/00bbc1482301d16de3ff63238cfd0b34.tiff",
+          "args": [
+            "--series",
+            "0"
+          ],
+          "metadata": {
+            "name": "00bbc1482301d16de3ff63238cfd0b34.tiff",
+            "width": 5120,
+            "height": 26624,
+            "sizeZ": 1,
+            "sizeT": 1,
+            "channelType": "DEFAULT",
+            "isRGB": true,
+            "pixelType": "UINT8",
+            "levels": [
+              {
+                "downsample": 1.0,
+                "width": 5120,
+                "height": 26624
+              }
+            ],
+            "channels": [
+              {
+                "name": "Red",
+                "color": -65536
+              },
+              {
+                "name": "Green",
+                "color": -16711936
+              },
+              {
+                "name": "Blue",
+                "color": -16776961
+              }
+            ],
+            "pixelCalibration": {
+              "pixelWidth": {
+                "value": 0.4861876369654638,
+                "unit": "µm"
+              },
+              "pixelHeight": {
+                "value": 0.4861876369654638,
+                "unit": "µm"
+              },
+              "zSpacing": {
+                "value": 1.0,
+                "unit": "z-slice"
+              },
+              "timeUnit": "SECONDS",
+              "timepoints": []
+            },
+            "preferredTileWidth": 512,
+            "preferredTileHeight": 512
+          }
+        },
+        "metadata": {
+          "name": "00bbc1482301d16de3ff63238cfd0b34.tiff",
+          "width": 5120,
+          "height": 26624,
+          "sizeZ": 1,
+          "sizeT": 1,
+          "channelType": "DEFAULT",
+          "isRGB": true,
+          "pixelType": "UINT8",
+          "levels": [
+            {
+              "downsample": 1.0,
+              "width": 5120,
+              "height": 26624
+            },
+            {
+              "downsample": 4.0,
+              "width": 1280,
+              "height": 6656
+            },
+            {
+              "downsample": 16.0,
+              "width": 320,
+              "height": 1664
+            }
+          ],
+          "channels": [
+            {
+              "name": "Red",
+              "color": -65536
+            },
+            {
+              "name": "Green",
+              "color": -16711936
+            },
+            {
+              "name": "Blue",
+              "color": -16776961
+            }
+          ],
+          "pixelCalibration": {
+            "pixelWidth": {
+              "value": 0.4861876369654638,
+              "unit": "µm"
+            },
+            "pixelHeight": {
+              "value": 0.4861876369654638,
+              "unit": "µm"
+            },
+            "zSpacing": {
+              "value": 1.0,
+              "unit": "z-slice"
+            },
+            "timeUnit": "SECONDS",
+            "timepoints": []
+          },
+          "preferredTileWidth": 512,
+          "preferredTileHeight": 512
+        }
+      },
+      "entryID": 2,
+      "randomizedName": "97b2c5ba-1bff-4a07-b0fc-4257ba4dfd91",
+      "imageName": "00bbc1482301d16de3ff63238cfd0b34.tiff",
+      "metadata": {},
+      "tags": []
+    },
+    {
+      "serverBuilder": {
+        "builderType": "pyramidize",
+        "builder": {
+          "builderType": "uri",
+          "providerClassName": "qupath.lib.images.servers.bioformats.BioFormatsServerBuilder",
+          "uri": "file:/C:/Users/Aleix/OneDrive%20-%20Universitat%20Polit%C3%A8cnica%20de%20Catalunya/Escritorio/UNI/TFG/Recerca%20primers%20datasets/SicapV2/SICAPv2/PANDAS/006f6aa35a78965c92fffd1fbd53a058.tiff",
+          "args": [
+            "--series",
+            "0"
+          ],
+          "metadata": {
+            "name": "006f6aa35a78965c92fffd1fbd53a058.tiff",
+            "width": 2048,
+            "height": 7680,
+            "sizeZ": 1,
+            "sizeT": 1,
+            "channelType": "DEFAULT",
+            "isRGB": true,
+            "pixelType": "UINT8",
+            "levels": [
+              {
+                "downsample": 1.0,
+                "width": 2048,
+                "height": 7680
+              }
+            ],
+            "channels": [
+              {
+                "name": "Red",
+                "color": -65536
+              },
+              {
+                "name": "Green",
+                "color": -16711936
+              },
+              {
+                "name": "Blue",
+                "color": -16776961
+              }
+            ],
+            "pixelCalibration": {
+              "pixelWidth": {
+                "value": 0.4861876369654638,
+                "unit": "µm"
+              },
+              "pixelHeight": {
+                "value": 0.4861876369654638,
+                "unit": "µm"
+              },
+              "zSpacing": {
+                "value": 1.0,
+                "unit": "z-slice"
+              },
+              "timeUnit": "SECONDS",
+              "timepoints": []
+            },
+            "preferredTileWidth": 512,
+            "preferredTileHeight": 512
+          }
+        },
+        "metadata": {
+          "name": "006f6aa35a78965c92fffd1fbd53a058.tiff",
+          "width": 2048,
+          "height": 7680,
+          "sizeZ": 1,
+          "sizeT": 1,
+          "channelType": "DEFAULT",
+          "isRGB": true,
+          "pixelType": "UINT8",
+          "levels": [
+            {
+              "downsample": 1.0,
+              "width": 2048,
+              "height": 7680
+            },
+            {
+              "downsample": 4.0,
+              "width": 512,
+              "height": 1920
+            }
+          ],
+          "channels": [
+            {
+              "name": "Red",
+              "color": -65536
+            },
+            {
+              "name": "Green",
+              "color": -16711936
+            },
+            {
+              "name": "Blue",
+              "color": -16776961
+            }
+          ],
+          "pixelCalibration": {
+            "pixelWidth": {
+              "value": 0.4861876369654638,
+              "unit": "µm"
+            },
+            "pixelHeight": {
+              "value": 0.4861876369654638,
+              "unit": "µm"
+            },
+            "zSpacing": {
+              "value": 1.0,
+              "unit": "z-slice"
+            },
+            "timeUnit": "SECONDS",
+            "timepoints": []
+          },
+          "preferredTileWidth": 512,
+          "preferredTileHeight": 512
+        }
+      },
+      "entryID": 4,
+      "randomizedName": "2600644e-a4dd-41cb-81b5-2ca772317990",
+      "imageName": "006f6aa35a78965c92fffd1fbd53a058.tiff",
+      "metadata": {},
+      "tags": []
+    },
+    {
+      "serverBuilder": {
+        "builderType": "pyramidize",
+        "builder": {
+          "builderType": "uri",
+          "providerClassName": "qupath.lib.images.servers.bioformats.BioFormatsServerBuilder",
+          "uri": "file:/C:/Users/Aleix/OneDrive%20-%20Universitat%20Polit%C3%A8cnica%20de%20Catalunya/Escritorio/UNI/TFG/Recerca%20primers%20datasets/SicapV2/SICAPv2/PANDAS/0018ae58b01bdadc8e347995b69f99aa.tiff",
+          "args": [
+            "--series",
+            "0"
+          ],
+          "metadata": {
+            "name": "0018ae58b01bdadc8e347995b69f99aa.tiff",
+            "width": 5888,
+            "height": 25344,
+            "sizeZ": 1,
+            "sizeT": 1,
+            "channelType": "DEFAULT",
+            "isRGB": true,
+            "pixelType": "UINT8",
+            "levels": [
+              {
+                "downsample": 1.0,
+                "width": 5888,
+                "height": 25344
+              }
+            ],
+            "channels": [
+              {
+                "name": "Red",
+                "color": -65536
+              },
+              {
+                "name": "Green",
+                "color": -16711936
+              },
+              {
+                "name": "Blue",
+                "color": -16776961
+              }
+            ],
+            "pixelCalibration": {
+              "pixelWidth": {
+                "value": 0.4861876369654638,
+                "unit": "µm"
+              },
+              "pixelHeight": {
+                "value": 0.4861876369654638,
+                "unit": "µm"
+              },
+              "zSpacing": {
+                "value": 1.0,
+                "unit": "z-slice"
+              },
+              "timeUnit": "SECONDS",
+              "timepoints": []
+            },
+            "preferredTileWidth": 512,
+            "preferredTileHeight": 512
+          }
+        },
+        "metadata": {
+          "name": "0018ae58b01bdadc8e347995b69f99aa.tiff",
+          "width": 5888,
+          "height": 25344,
+          "sizeZ": 1,
+          "sizeT": 1,
+          "channelType": "DEFAULT",
+          "isRGB": true,
+          "pixelType": "UINT8",
+          "levels": [
+            {
+              "downsample": 1.0,
+              "width": 5888,
+              "height": 25344
+            },
+            {
+              "downsample": 4.0,
+              "width": 1472,
+              "height": 6336
+            },
+            {
+              "downsample": 16.0,
+              "width": 368,
+              "height": 1584
+            }
+          ],
+          "channels": [
+            {
+              "name": "Red",
+              "color": -65536
+            },
+            {
+              "name": "Green",
+              "color": -16711936
+            },
+            {
+              "name": "Blue",
+              "color": -16776961
+            }
+          ],
+          "pixelCalibration": {
+            "pixelWidth": {
+              "value": 0.4861876369654638,
+              "unit": "µm"
+            },
+            "pixelHeight": {
+              "value": 0.4861876369654638,
+              "unit": "µm"
+            },
+            "zSpacing": {
+              "value": 1.0,
+              "unit": "z-slice"
+            },
+            "timeUnit": "SECONDS",
+            "timepoints": []
+          },
+          "preferredTileWidth": 512,
+          "preferredTileHeight": 512
+        }
+      },
+      "entryID": 6,
+      "randomizedName": "26eaeca4-0f03-4613-9983-032f4dfb6c8a",
+      "imageName": "0018ae58b01bdadc8e347995b69f99aa.tiff",
       "metadata": {},
       "tags": []
     }

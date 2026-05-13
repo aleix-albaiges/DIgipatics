@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
@@ -404,6 +405,70 @@ def metrics_from_confusion(cm: np.ndarray, class_names: Sequence[str]) -> Dict[s
     }
 
 
+def binary_mask_to_geojson(mask: np.ndarray, level_downsample: float, case_id: str) -> Dict[str, object]:
+    """
+    Convert a binary mask (0=NC, 1=Cancer) into GeoJSON polygons.
+    The output coordinates are scaled to level-0 WSI pixels.
+    """
+    if mask.ndim != 2:
+        raise ValueError("binary_mask_to_geojson expects a 2D mask.")
+
+    positive = (mask == 1).astype(np.uint8)
+    h, w = positive.shape
+    if h == 0 or w == 0 or int(positive.sum()) == 0:
+        return {"type": "FeatureCollection", "features": []}
+
+    # Clean tiny artifacts and thin gaps to improve polygon quality.
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    cleaned = cv2.morphologyEx(positive, cv2.MORPH_OPEN, kernel, iterations=1)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # Pixel-level contours (no polygon simplification) to avoid boxy annotations.
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if len(contours) == 0:
+        return {"type": "FeatureCollection", "features": []}
+
+    min_area_px = 64.0
+    scale = float(level_downsample)
+    features: List[Dict[str, object]] = []
+    feature_id = 0
+    for contour_idx, contour in enumerate(contours):
+        area = float(cv2.contourArea(contour))
+        if area < min_area_px:
+            continue
+
+        if contour.shape[0] < 3:
+            continue
+
+        shell_ring = [[float(pt[0][0]) * scale, float(pt[0][1]) * scale] for pt in contour]
+        if shell_ring[0] != shell_ring[-1]:
+            shell_ring.append(shell_ring[0])
+
+        features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "case_id": case_id,
+                    "class_id": 1,
+                    "class_name": "Cancer",
+                    "feature_id": feature_id,
+                },
+                "geometry": {"type": "Polygon", "coordinates": [shell_ring]},
+            }
+        )
+        feature_id += 1
+
+    return {"type": "FeatureCollection", "features": features}
+
+
+def save_binary_prediction_geojson(case_dir: Path, case_id: str, pred_canvas: np.ndarray, level_downsample: float) -> str:
+    geojson = binary_mask_to_geojson(pred_canvas, level_downsample=level_downsample, case_id=case_id)
+    output_name = "case_pred_binary_annotations.geojson"
+    output_path = case_dir / output_name
+    output_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
+    return output_name
+
+
 def batched_inference(model: torch.nn.Module, images: Sequence[np.ndarray], device: torch.device, batch_size: int) -> List[np.ndarray]:
     outputs: List[np.ndarray] = []
     with torch.inference_mode():
@@ -675,6 +740,16 @@ def run_case(
         gt_canvas=gt_canvas,
         coverage=coverage,
     )
+    binary_geojson_name: Optional[str] = None
+    if binary_cancer_mode:
+        downsample_factors = level_downsamples(case.wsi_structure)
+        level_downsample = downsample_factors[level_index]
+        binary_geojson_name = save_binary_prediction_geojson(
+            case_dir=case_dir,
+            case_id=case.case_id,
+            pred_canvas=pred_canvas,
+            level_downsample=level_downsample,
+        )
 
     summary = {
         "case_id": case.case_id,
@@ -689,6 +764,7 @@ def run_case(
         "num_tiles": len(tile_rows),
         "blend_mode": effective_blend_mode,
         "aggregate_metrics": aggregate_metrics,
+        "binary_prediction_geojson": binary_geojson_name,
     }
     (case_dir / "case_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
