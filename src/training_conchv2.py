@@ -104,6 +104,8 @@ _FEATURE_BLOCKS = [2, 5, 8, 11]
 
 # Same as in the official CONCH README (hf_hub:MahmoodLab/conch)
 CONCH_HF_CHECKPOINT = "hf_hub:MahmoodLab/conch"
+CONCH_NORM_MEAN = [0.48145466, 0.4578275, 0.40821073]
+CONCH_NORM_STD  = [0.26862954, 0.26130258, 0.27577711]
 
 DEFAULT_CONFIG = {
     "num_classes"   : NUM_CLASSES,
@@ -125,15 +127,22 @@ DEFAULT_CONFIG = {
     # ReduceLROnPlateau: lower LR sooner when macro-F1 stalls (e.g., after ~4 epochs).
     "lr_plateau_patience": 3,
     "fpn_channels"  : 256,
-    "unfreeze_last" : 0,
+    "unfreeze_last" : 2,
     "use_weighted_sampler": True,
     # Oversampling by mask presence (hierarchy: GG5 > GG4 > GG3 > rest)
-    "sampler_weight_gg5": 2.5,
+    "sampler_weight_gg5": 1.8,
     "sampler_weight_gg4": 1.3,
     "sampler_weight_gg3": 1.8,
     "use_compile"   : None,
     "conch_checkpoint": None,   # None → CONCH_HF_CHECKPOINT
     "conch_hf_token" : None,
+    "use_imagenet_norm": False,
+    "norm_mean"        : list(CONCH_NORM_MEAN),
+    "norm_std"         : list(CONCH_NORM_STD),
+    "color_aug_enabled": True,
+    "sampler_replacement": False,
+    "tta_enabled"        : False,
+    "tta_scales"         : (1.0,),
     "seed"            : DEFAULT_SEED,
 }
 
@@ -145,6 +154,89 @@ _MASK_LUT = np.zeros(256, dtype=np.int64)
 _MASK_LUT[25:75] = 1
 _MASK_LUT[75:175] = 2
 _MASK_LUT[175:] = 3
+
+_D4_TRANSFORMS = (
+    "identity",
+    "hflip",
+    "vflip",
+    "rot90",
+    "rot180",
+    "rot270",
+    "hflip_rot90",
+    "vflip_rot90",
+)
+_MISSING = object()
+
+
+def resolve_normalization(use_imagenet_norm: bool):
+    if use_imagenet_norm:
+        return (
+            [0.485, 0.456, 0.406],
+            [0.229, 0.224, 0.225],
+            (
+                "Using ImageNet normalization via --imagenet-norm; "
+                "this ablation reverts the old behavior and does not match CONCH/CLIP pretraining."
+            ),
+        )
+    return list(CONCH_NORM_MEAN), list(CONCH_NORM_STD), None
+
+
+def _build_elastic_transform():
+    kwargs = dict(
+        alpha=30,
+        sigma=5,
+        p=0.3,
+        border_mode=cv2.BORDER_REFLECT_101,
+    )
+    probe_image = np.zeros((16, 16, 3), dtype=np.uint8)
+    probe_mask = np.zeros((16, 16), dtype=np.uint8)
+
+    def _candidate_kwargs(alpha_affine_marker):
+        probe_kwargs = dict(kwargs)
+        probe_kwargs["p"] = 1.0  # force execution during compatibility probing
+        final_kwargs = dict(kwargs)
+        if alpha_affine_marker is not _MISSING:
+            probe_kwargs["alpha_affine"] = alpha_affine_marker
+            final_kwargs["alpha_affine"] = alpha_affine_marker
+        return probe_kwargs, final_kwargs
+
+    candidates = (
+        ("alpha_affine=None", None),
+        ("alpha_affine=0.0", 0.0),
+        ("alpha_affine omitted", _MISSING),
+    )
+
+    last_error = None
+    for label, alpha_affine_marker in candidates:
+        try:
+            probe_kwargs, final_kwargs = _candidate_kwargs(alpha_affine_marker)
+            probe_transform = A.ElasticTransform(**probe_kwargs)
+            probe_transform(image=probe_image, mask=probe_mask)
+            if label != "alpha_affine=None":
+                print(
+                    "  [WARN] ElasticTransform does not support alpha_affine=None in this "
+                    f"Albumentations build; using {label} fallback."
+                )
+            return A.ElasticTransform(**final_kwargs)
+        except (TypeError, ValueError) as e:
+            last_error = e
+
+    raise RuntimeError("Unable to construct a compatible Albumentations ElasticTransform.") from last_error
+
+
+def parse_tta_scales(scales_text: str):
+    values = []
+    for raw in scales_text.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        scale = float(item)
+        if scale <= 0:
+            raise ValueError("All --tta-scales values must be > 0.")
+        values.append(scale)
+    if not values:
+        raise ValueError("--tta-scales must contain at least one positive float.")
+    return tuple(values)
 
 
 def compute_sample_weights(
@@ -211,24 +303,37 @@ class SICAPv2Dataset(Dataset):
         return image, mask
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Augmentations — identicals al original
+# Augmentations — CONCH/CLIP normalization + optional color/deformation aug
 # ─────────────────────────────────────────────────────────────────────────────
-def get_train_transforms():
-    return A.Compose([
+def get_train_transforms(norm_mean=None, norm_std=None, color_aug_enabled: bool = True):
+    norm_mean = list(CONCH_NORM_MEAN) if norm_mean is None else list(norm_mean)
+    norm_std = list(CONCH_NORM_STD) if norm_std is None else list(norm_std)
+
+    steps = [
         A.Resize(IMG_SIZE, IMG_SIZE),  # multiple of patch_size=16
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.Rotate(limit=180, border_mode=cv2.BORDER_REFLECT_101, p=0.7),
         A.RandomBrightnessContrast(brightness_limit=0, contrast_limit=0.2, p=0.5),
         A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]
+    if color_aug_enabled:
+        steps.extend([
+            A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02, p=0.5),
+            _build_elastic_transform(),
+        ])
+    steps.extend([
+        A.Normalize(mean=norm_mean, std=norm_std),
         ToTensorV2(),
     ])
+    return A.Compose(steps)
 
-def get_val_transforms():
+def get_val_transforms(norm_mean=None, norm_std=None):
+    norm_mean = list(CONCH_NORM_MEAN) if norm_mean is None else list(norm_mean)
+    norm_std = list(CONCH_NORM_STD) if norm_std is None else list(norm_std)
     return A.Compose([
         A.Resize(IMG_SIZE, IMG_SIZE),  # multiple of patch_size=16
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        A.Normalize(mean=norm_mean, std=norm_std),
         ToTensorV2(),
     ])
 
@@ -242,8 +347,24 @@ def get_fold_dataloaders(fold_name: str, config: dict):
     train_names = train_df["image_name"].tolist()
     val_names   = val_df["image_name"].tolist()
 
-    train_ds = SICAPv2Dataset(train_names, IMAGES_DIR, MASKS_DIR, transform=get_train_transforms())
-    val_ds   = SICAPv2Dataset(val_names,   IMAGES_DIR, MASKS_DIR, transform=get_val_transforms())
+    norm_mean = config.get("norm_mean", CONCH_NORM_MEAN)
+    norm_std = config.get("norm_std", CONCH_NORM_STD)
+    train_ds = SICAPv2Dataset(
+        train_names,
+        IMAGES_DIR,
+        MASKS_DIR,
+        transform=get_train_transforms(
+            norm_mean=norm_mean,
+            norm_std=norm_std,
+            color_aug_enabled=config.get("color_aug_enabled", True),
+        ),
+    )
+    val_ds = SICAPv2Dataset(
+        val_names,
+        IMAGES_DIR,
+        MASKS_DIR,
+        transform=get_val_transforms(norm_mean=norm_mean, norm_std=norm_std),
+    )
 
     workers = int(os.environ.get("SLURM_CPUS_PER_TASK", config["num_workers"]))
     kwargs  = {"persistent_workers": True, "prefetch_factor": 4} if workers > 0 else {}
@@ -269,9 +390,14 @@ def get_fold_dataloaders(fold_name: str, config: dict):
         n3 = sum(1 for x in sw if x == w3)
         print(
             f"  [Sampler] train={len(train_names)} | GG5×{w5}={n5} | "
-            f"GG4×{w4}={n4} | GG3×{w3}={n3}"
+            f"GG4×{w4}={n4} | GG3×{w3}={n3} | "
+            f"replacement={config.get('sampler_replacement', False)}"
         )
-        sampler = WeightedRandomSampler(weights=sw, num_samples=len(train_names), replacement=True)
+        sampler = WeightedRandomSampler(
+            weights=sw,
+            num_samples=len(train_names),
+            replacement=config.get("sampler_replacement", False),
+        )
         train_loader = DataLoader(
             train_ds, batch_size=config["batch_size"], sampler=sampler,
             drop_last=True, **dl_common, **kwargs,
@@ -557,8 +683,92 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, grad_ac
         optimizer.zero_grad(set_to_none=True)
     return total_loss / max(num_batches, 1)
 
+
+def _apply_d4_transform(tensor: torch.Tensor, transform_name: str) -> torch.Tensor:
+    if transform_name == "identity":
+        return tensor
+    if transform_name == "hflip":
+        return torch.flip(tensor, dims=(-1,))
+    if transform_name == "vflip":
+        return torch.flip(tensor, dims=(-2,))
+    if transform_name == "rot90":
+        return torch.rot90(tensor, 1, dims=(-2, -1))
+    if transform_name == "rot180":
+        return torch.rot90(tensor, 2, dims=(-2, -1))
+    if transform_name == "rot270":
+        return torch.rot90(tensor, 3, dims=(-2, -1))
+    if transform_name == "hflip_rot90":
+        return torch.rot90(torch.flip(tensor, dims=(-1,)), 1, dims=(-2, -1))
+    if transform_name == "vflip_rot90":
+        return torch.rot90(torch.flip(tensor, dims=(-2,)), 1, dims=(-2, -1))
+    raise ValueError(f"Unknown D4 transform: {transform_name}")
+
+
+def _invert_d4_transform(tensor: torch.Tensor, transform_name: str) -> torch.Tensor:
+    if transform_name == "identity":
+        return tensor
+    if transform_name == "hflip":
+        return torch.flip(tensor, dims=(-1,))
+    if transform_name == "vflip":
+        return torch.flip(tensor, dims=(-2,))
+    if transform_name == "rot90":
+        return torch.rot90(tensor, 3, dims=(-2, -1))
+    if transform_name == "rot180":
+        return torch.rot90(tensor, 2, dims=(-2, -1))
+    if transform_name == "rot270":
+        return torch.rot90(tensor, 1, dims=(-2, -1))
+    if transform_name == "hflip_rot90":
+        return torch.flip(torch.rot90(tensor, 3, dims=(-2, -1)), dims=(-1,))
+    if transform_name == "vflip_rot90":
+        return torch.flip(torch.rot90(tensor, 3, dims=(-2, -1)), dims=(-2,))
+    raise ValueError(f"Unknown D4 transform: {transform_name}")
+
+
+def _scaled_size_to_patch_multiple(size: int, scale: float, patch_size: int = 16) -> int:
+    return max(patch_size, int(round(size * scale / patch_size) * patch_size))
+
+
+def tta_forward(model, images, scales=(1.0,), use_d4=True):
+    orig_h, orig_w = images.shape[-2:]
+    view_names = _D4_TRANSFORMS if use_d4 else ("identity",)
+    logits_sum = None
+    num_views = 0
+
+    for scale in tuple(scales):
+        scale = float(scale)
+        if scale <= 0:
+            raise ValueError("TTA scales must be positive.")
+
+        if scale == 1.0:
+            scaled_images = images
+        else:
+            scaled_h = _scaled_size_to_patch_multiple(orig_h, scale)
+            scaled_w = _scaled_size_to_patch_multiple(orig_w, scale)
+            if (scaled_h, scaled_w) == (orig_h, orig_w):
+                scaled_images = images
+            else:
+                scaled_images = F.interpolate(
+                    images,
+                    size=(scaled_h, scaled_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+        for transform_name in view_names:
+            logits = model(_apply_d4_transform(scaled_images, transform_name))
+            logits = _invert_d4_transform(logits, transform_name)
+            if logits.shape[-2:] != (orig_h, orig_w):
+                logits = F.interpolate(logits, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+            logits = logits.float()
+            logits_sum = logits if logits_sum is None else logits_sum + logits
+            num_views += 1
+
+    if logits_sum is None:
+        raise RuntimeError("TTA produced no logits.")
+    return logits_sum / float(num_views)
+
 @torch.no_grad()
-def validate_one_epoch(model, loader, criterion, device):
+def validate_one_epoch(model, loader, criterion, device, tta_config=None):
     model.eval()
     total_loss, num_batches = 0.0, 0
     metrics = SegmentationMetrics(NUM_CLASSES)
@@ -569,7 +779,15 @@ def validate_one_epoch(model, loader, criterion, device):
     for images, masks in pbar:
         images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True).long()
         with autocast("cuda", enabled=(device.type == "cuda"), dtype=amp_dtype):
-            logits = model(images)
+            if tta_config is None:
+                logits = model(images)
+            else:
+                logits = tta_forward(
+                    model,
+                    images,
+                    scales=tta_config.get("scales", (1.0,)),
+                    use_d4=tta_config.get("use_d4", True),
+                )
             loss   = criterion(logits, masks)
         total_loss += loss.item()
         num_batches += 1
@@ -582,6 +800,10 @@ def validate_one_epoch(model, loader, criterion, device):
 def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool = False, use_wandb: bool = True):
     print(f"\n{'='*60}\n  FOLD: {fold_name}\n{'='*60}")
     train_loader, val_loader = get_fold_dataloaders(fold_name, config)
+    tta_config = None
+    if config.get("tta_enabled", False):
+        tta_config = {"use_d4": True, "scales": tuple(config.get("tta_scales", (1.0,)))}
+        print(f"  [TTA] Validation enabled | D4=True | scales={tta_config['scales']}")
 
     model = build_model(config).to(device)
 
@@ -630,7 +852,9 @@ def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool
             model, train_loader, criterion, optimizer, scaler, device,
             grad_accum_steps=ga,
         )
-        val_loss, val_metrics = validate_one_epoch(model, val_loader, criterion, device)
+        val_loss, val_metrics = validate_one_epoch(
+            model, val_loader, criterion, device, tta_config=tta_config,
+        )
 
         macro_f1 = val_metrics["macro_f1"]
         scheduler.step(macro_f1)
@@ -728,8 +952,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run",       action="store_true",
                         help="Smoke test: 1 batch por fold")
-    parser.add_argument("--unfreeze-last", type=int, default=0,
-                        help="Unfreeze the last N CONCH ViT-B blocks (default: 0)")
+    parser.add_argument(
+        "--unfreeze-last",
+        type=int,
+        default=2,
+        help=(
+            "Unfreeze the last N CONCH ViT-B blocks. Default 2 based on empirical ablation "
+            "on SICAPv2 Val1-Val4; previous default was 0, previous best run used 6 but overfits Val1."
+        ),
+    )
     parser.add_argument("--weights", type=str, default=None, metavar="PATH",
                         help="pytorch_model.bin local (alternativa a descarga desde Hugging Face)")
     parser.add_argument("--hf-token", type=str, default=None,
@@ -744,6 +975,16 @@ def main():
                         help="Peso sampler tiles con GG4 (sin GG5; default config).")
     parser.add_argument("--sampler-gg3", type=float, default=None, metavar="W",
                         help="Peso sampler tiles con GG3 (sin GG4/GG5; default config).")
+    parser.add_argument("--sampler-replacement", action="store_true",
+                        help="Re-enable WeightedRandomSampler replacement=True for ablation/backward compatibility.")
+    parser.add_argument("--imagenet-norm", action="store_true",
+                        help="Use ImageNet normalization instead of the CONCH/CLIP defaults (ablation).")
+    parser.add_argument("--no-color-aug", action="store_true",
+                        help="Disable ColorJitter + ElasticTransform in train augmentations.")
+    parser.add_argument("--tta", action="store_true",
+                        help="Enable D4 test-time augmentation during validation.")
+    parser.add_argument("--tta-scales", type=str, default="1.0",
+                        help='Comma-separated TTA scales for validation, e.g. "0.875,1.0,1.125". Ignored unless --tta is set.')
     parser.add_argument("--compile", action="store_true", help="Force torch.compile (Windows: can fail or use more VRAM).")
     parser.add_argument("--no-compile", action="store_true", help="Desactivar torch.compile.")
     parser.add_argument("--no-wandb", action="store_true", help="Do not log to Weights & Biases.")
@@ -780,6 +1021,22 @@ def main():
     config = DEFAULT_CONFIG.copy()
     config["seed"] = args.seed
     config["unfreeze_last"] = args.unfreeze_last
+    norm_mean, norm_std, norm_warning = resolve_normalization(args.imagenet_norm)
+    config["use_imagenet_norm"] = args.imagenet_norm
+    config["norm_mean"] = norm_mean
+    config["norm_std"] = norm_std
+    config["color_aug_enabled"] = not args.no_color_aug
+    config["sampler_replacement"] = args.sampler_replacement
+    config["tta_enabled"] = args.tta
+    if args.tta:
+        try:
+            config["tta_scales"] = parse_tta_scales(args.tta_scales)
+        except ValueError as e:
+            parser.error(str(e))
+    else:
+        config["tta_scales"] = (1.0,)
+    if norm_warning:
+        print(f"  [WARN] {norm_warning}")
     if args.weights:
         config["conch_checkpoint"] = args.weights
     if args.hf_token:
@@ -816,38 +1073,56 @@ def main():
         f"{config['class_weights']} | dice/ce: {config['dice_weight']}/{config['ce_weight']} | "
         f"lr_plateau_patience={config.get('lr_plateau_patience', 3)}"
     )
+    print(
+        f"  norm_mean={config['norm_mean']} | norm_std={config['norm_std']} | "
+        f"color_aug_enabled={config['color_aug_enabled']} | "
+        f"sampler_replacement={config['sampler_replacement']} | "
+        f"tta_enabled={config['tta_enabled']} | tta_scales={config['tta_scales']}"
+    )
 
     use_wandb = not args.no_wandb
+    wandb_config = {
+        "script": "training_conch",
+        "img_size": IMG_SIZE,
+        "encoder": "CONCH_ViT-B-16_visual",
+        "fpn_channels": config["fpn_channels"],
+        "batch_size": config["batch_size"],
+        "grad_accum_steps": config.get("grad_accum_steps", 1),
+        "effective_batch": eff,
+        "learning_rate": config["learning_rate"],
+        "weight_decay": config["weight_decay"],
+        "max_epochs": config["max_epochs"],
+        "patience": config["patience"],
+        "dice_weight": config["dice_weight"],
+        "ce_weight": config["ce_weight"],
+        "class_weights": list(config["class_weights"]),
+        "unfreeze_last": config["unfreeze_last"],
+        "weighted_sampler": config.get("use_weighted_sampler", False),
+        "sampler_weight_gg5": config.get("sampler_weight_gg5"),
+        "sampler_weight_gg4": config.get("sampler_weight_gg4"),
+        "sampler_weight_gg3": config.get("sampler_weight_gg3"),
+        "sampler_replacement": config.get("sampler_replacement", False),
+        "norm_mean": list(config["norm_mean"]),
+        "norm_std": list(config["norm_std"]),
+        "color_aug_enabled": config.get("color_aug_enabled", True),
+        "tta_enabled": config.get("tta_enabled", False),
+        "tta_scales": list(config.get("tta_scales", (1.0,))),
+        "imagenet_norm": config.get("use_imagenet_norm", False),
+        "norm_source": "imagenet" if config.get("use_imagenet_norm", False) else "conch_clip",
+        "conch_checkpoint": config.get("conch_checkpoint") or CONCH_HF_CHECKPOINT,
+        "output_dir": str(config["output_dir"]),
+        "mask_lut": "43:85->GG3, 85:160->GG4, 160:255->GG5, else->NC",
+        "pixel_frac_partition": [float(x) for x in _PIXEL_FRAC_PARTITION],
+        "lr_plateau_patience": config.get("lr_plateau_patience", 3),
+        "seed": config.get("seed", DEFAULT_SEED),
+        "fold": args.fold,
+    }
+    if norm_warning:
+        wandb_config["norm_warning"] = norm_warning
+    if args.dry_run:
+        print(f"wandb_config (dry-run): {wandb_config}")
     if use_wandb and not args.dry_run:
         try:
-            wandb_config = {
-                "script": "training_conch",
-                "img_size": IMG_SIZE,
-                "encoder": "CONCH_ViT-B-16_visual",
-                "fpn_channels": config["fpn_channels"],
-                "batch_size": config["batch_size"],
-                "grad_accum_steps": config.get("grad_accum_steps", 1),
-                "effective_batch": eff,
-                "learning_rate": config["learning_rate"],
-                "weight_decay": config["weight_decay"],
-                "max_epochs": config["max_epochs"],
-                "patience": config["patience"],
-                "dice_weight": config["dice_weight"],
-                "ce_weight": config["ce_weight"],
-                "class_weights": list(config["class_weights"]),
-                "unfreeze_last": config["unfreeze_last"],
-                "weighted_sampler": config.get("use_weighted_sampler", False),
-                "sampler_weight_gg5": config.get("sampler_weight_gg5"),
-                "sampler_weight_gg4": config.get("sampler_weight_gg4"),
-                "sampler_weight_gg3": config.get("sampler_weight_gg3"),
-                "conch_checkpoint": config.get("conch_checkpoint") or CONCH_HF_CHECKPOINT,
-                "output_dir": str(config["output_dir"]),
-                "mask_lut": "43:85->GG3, 85:160->GG4, 160:255->GG5, else->NC",
-                "pixel_frac_partition": [float(x) for x in _PIXEL_FRAC_PARTITION],
-                "lr_plateau_patience": config.get("lr_plateau_patience", 3),
-                "seed": config.get("seed", DEFAULT_SEED),
-                "fold": args.fold,
-            }
             run_name = args.wandb_name or (
                 f"CONCH_masklut_bs{config['batch_size']}_ga{config.get('grad_accum_steps', 1)}"
             )

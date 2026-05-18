@@ -93,7 +93,12 @@ def parse_args() -> argparse.Namespace:
         help="CSV metadata de PANDA (si no se indica: <data-dir>/train.csv).",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/pandas_tile_inference"))
-    parser.add_argument("--checkpoints-csv", type=Path, default=Path("checkpoints_conch_masklut/best_per_fold.csv"))
+    parser.add_argument(
+        "--checkpoints-csv",
+        type=Path,
+        default=Path("artifacts/checkpoints_conch_masklut/best_per_fold.csv"),
+        help="CSV con fold + checkpoint_path (p.ej. Gleason 4 clases: artifacts/checkpoints_conch_masklut/best_per_fold.csv).",
+    )
     parser.add_argument("--fold", type=str, default=None, help="Fold to use from the CSV. Defaults to best macro_f1.")
     parser.add_argument("--checkpoint-path", type=Path, default=None, help="Direct checkpoint path override.")
     parser.add_argument("--case-id", type=str, nargs="*", default=None, help="Optional list of specific PANDAS case ids.")
@@ -127,6 +132,28 @@ def parse_args() -> argparse.Namespace:
         help="Binary mode: NC vs Cancer. GT cancer is derived from Gleason labels.",
     )
     parser.add_argument("--allow-karolinska", action="store_true")
+    parser.add_argument(
+        "--skip-gleason-geojson",
+        action="store_true",
+        help="(4-class) No escribir GeoJSON Gleason (pred + GT suavizado).",
+    )
+    parser.add_argument(
+        "--gt-geojson-blur-sigma",
+        type=float,
+        default=4.0,
+        help="Sigma (píxeles a nivel de inferencia) para suavizar el GT antes de contornos. 0 = sin blur.",
+    )
+    parser.add_argument(
+        "--gt-geojson-fill-opacity",
+        type=float,
+        default=0.35,
+        help="Opacidad de relleno sugerida en propiedades GeoJSON del GT (QuPath/visores que la lean).",
+    )
+    parser.add_argument(
+        "--geojson-include-nc",
+        action="store_true",
+        help="Incluir polígonos de clase NC en GeoJSON multiclase (más pesado). Por defecto solo GG3/GG4/GG5.",
+    )
     parser.add_argument("--log-level", type=str, default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
 
@@ -156,6 +183,10 @@ def load_checkpoint_row(csv_path: Path, fold: Optional[str]) -> Tuple[Dict[str, 
     checkpoint_path = Path(str(row["checkpoint_path"]))
     if not checkpoint_path.is_absolute():
         checkpoint_path = (REPO_ROOT / checkpoint_path).resolve()
+    if not checkpoint_path.exists():
+        alt = REPO_ROOT / "artifacts" / Path(str(row["checkpoint_path"]))
+        if alt.exists():
+            checkpoint_path = alt.resolve()
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     return row.to_dict(), checkpoint_path
@@ -461,6 +492,130 @@ def binary_mask_to_geojson(mask: np.ndarray, level_downsample: float, case_id: s
     return {"type": "FeatureCollection", "features": features}
 
 
+def multiclass_mask_to_geojson(
+    mask: np.ndarray,
+    level_downsample: float,
+    case_id: str,
+    class_names: Sequence[str],
+    *,
+    skip_nc: bool,
+    blur_sigma: float,
+    fill_opacity: Optional[float],
+    is_ground_truth: bool,
+) -> Dict[str, object]:
+    """
+    Exporta polígonos por clase (Gleason SICAP: NC, GG3, GG4, GG5).
+    Para GT difuminado: blur_sigma > 0 suaviza bordes antes de extraer contornos;
+    fill_opacity en propiedades para visores/QuPath que respeten opacidad en GeoJSON.
+    """
+    if mask.ndim != 2:
+        raise ValueError("multiclass_mask_to_geojson expects a 2D mask.")
+
+    num_classes = len(class_names)
+    scale = float(level_downsample)
+    features: List[Dict[str, object]] = []
+    feature_id = 0
+
+    class_indices = list(range(num_classes))
+    if skip_nc:
+        class_indices = [i for i in class_indices if i != 0]
+
+    ksize = 3
+    if blur_sigma > 0:
+        ksize = max(3, int(6 * blur_sigma + 1) | 1)
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    min_area_px = 64.0
+
+    for class_id in class_indices:
+        binary = (mask == class_id).astype(np.uint8)
+        if int(binary.sum()) == 0:
+            continue
+
+        if blur_sigma > 0:
+            blurred = cv2.GaussianBlur(binary.astype(np.float32), (ksize, ksize), float(blur_sigma))
+            binary = (blurred >= 0.5).astype(np.uint8)
+            if int(binary.sum()) == 0:
+                continue
+
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < min_area_px:
+                continue
+            if contour.shape[0] < 3:
+                continue
+            shell_ring = [[float(pt[0][0]) * scale, float(pt[0][1]) * scale] for pt in contour]
+            if shell_ring[0] != shell_ring[-1]:
+                shell_ring.append(shell_ring[0])
+
+            props: Dict[str, object] = {
+                "case_id": case_id,
+                "class_id": int(class_id),
+                "class_name": class_names[class_id],
+                "feature_id": feature_id,
+                "is_ground_truth": bool(is_ground_truth),
+            }
+            if fill_opacity is not None:
+                props["fillOpacity"] = float(fill_opacity)
+                props["strokeOpacity"] = float(min(1.0, fill_opacity + 0.25))
+
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": props,
+                    "geometry": {"type": "Polygon", "coordinates": [shell_ring]},
+                }
+            )
+            feature_id += 1
+
+    return {"type": "FeatureCollection", "features": features}
+
+
+def save_gleason_geojson_pair(
+    case_dir: Path,
+    case_id: str,
+    pred_canvas: np.ndarray,
+    gt_canvas: np.ndarray,
+    level_downsample: float,
+    class_names: Sequence[str],
+    *,
+    skip_nc: bool,
+    gt_blur_sigma: float,
+    gt_fill_opacity: float,
+) -> Tuple[str, str]:
+    pred_geojson = multiclass_mask_to_geojson(
+        pred_canvas,
+        level_downsample,
+        case_id,
+        class_names,
+        skip_nc=skip_nc,
+        blur_sigma=0.0,
+        fill_opacity=None,
+        is_ground_truth=False,
+    )
+    pred_name = "case_pred_gleason_annotations.geojson"
+    (case_dir / pred_name).write_text(json.dumps(pred_geojson, indent=2), encoding="utf-8")
+
+    gt_geojson = multiclass_mask_to_geojson(
+        gt_canvas,
+        level_downsample,
+        case_id,
+        class_names,
+        skip_nc=skip_nc,
+        blur_sigma=gt_blur_sigma,
+        fill_opacity=gt_fill_opacity,
+        is_ground_truth=True,
+    )
+    gt_name = "case_gt_gleason_annotations_soft.geojson"
+    (case_dir / gt_name).write_text(json.dumps(gt_geojson, indent=2), encoding="utf-8")
+
+    return pred_name, gt_name
+
+
 def save_binary_prediction_geojson(case_dir: Path, case_id: str, pred_canvas: np.ndarray, level_downsample: float) -> str:
     geojson = binary_mask_to_geojson(pred_canvas, level_downsample=level_downsample, case_id=case_id)
     output_name = "case_pred_binary_annotations.geojson"
@@ -608,6 +763,10 @@ def run_case(
     num_classes: int,
     class_names: Sequence[str],
     binary_cancer_mode: bool,
+    export_gleason_geojson: bool,
+    gt_geojson_blur_sigma: float,
+    gt_geojson_fill_opacity: float,
+    geojson_skip_nc: bool,
 ) -> Dict[str, object]:
     level_index, effective_mag = choose_level_for_magnification(case.wsi_structure, source_magnification, target_magnification)
     LOGGER.info("Case %s -> level %s (effective %.2fx)", case.case_id, level_index, effective_mag)
@@ -740,15 +899,31 @@ def run_case(
         gt_canvas=gt_canvas,
         coverage=coverage,
     )
+    downsample_factors = level_downsamples(case.wsi_structure)
+    level_downsample = downsample_factors[level_index]
+
     binary_geojson_name: Optional[str] = None
+    pred_gleason_geojson_name: Optional[str] = None
+    gt_gleason_geojson_name: Optional[str] = None
+
     if binary_cancer_mode:
-        downsample_factors = level_downsamples(case.wsi_structure)
-        level_downsample = downsample_factors[level_index]
         binary_geojson_name = save_binary_prediction_geojson(
             case_dir=case_dir,
             case_id=case.case_id,
             pred_canvas=pred_canvas,
             level_downsample=level_downsample,
+        )
+    elif export_gleason_geojson:
+        pred_gleason_geojson_name, gt_gleason_geojson_name = save_gleason_geojson_pair(
+            case_dir=case_dir,
+            case_id=case.case_id,
+            pred_canvas=pred_canvas,
+            gt_canvas=gt_canvas,
+            level_downsample=level_downsample,
+            class_names=class_names,
+            skip_nc=geojson_skip_nc,
+            gt_blur_sigma=gt_geojson_blur_sigma,
+            gt_fill_opacity=gt_geojson_fill_opacity,
         )
 
     summary = {
@@ -765,6 +940,8 @@ def run_case(
         "blend_mode": effective_blend_mode,
         "aggregate_metrics": aggregate_metrics,
         "binary_prediction_geojson": binary_geojson_name,
+        "pred_gleason_geojson": pred_gleason_geojson_name,
+        "gt_gleason_geojson_soft": gt_gleason_geojson_name,
     }
     (case_dir / "case_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
@@ -819,6 +996,10 @@ def main() -> None:
                 num_classes=num_classes,
                 class_names=class_names,
                 binary_cancer_mode=args.binary_cancer_mode,
+                export_gleason_geojson=not args.skip_gleason_geojson,
+                gt_geojson_blur_sigma=args.gt_geojson_blur_sigma,
+                gt_geojson_fill_opacity=args.gt_geojson_fill_opacity,
+                geojson_skip_nc=not args.geojson_include_nc,
             )
             case_summaries.append(case_summary)
         except RuntimeError as exc:
