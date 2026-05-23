@@ -2,7 +2,7 @@
   "version": "0.7.0",
   "createTimestamp": 1777986201152,
   "modifyTimestamp": 1777986201152,
-  "uri": "file:/C:/Users/Aleix/OneDrive%20-%20Universitat%20Politècnica%20de%20Catalunya/Escritorio/UNI/TFG/Recerca%20primers%20datasets/SicapV2/SICAPv2/data/qupath_project/project.qpproj",
+  "uri": "file:/C:/Users/Aleix/OneDrive%20-%20Universitat%20Politècnica%20de%20Catalunya/Escritorio/UNI/TFG/Recerca%20primers%20datasets/SicapV2/SICAPv2/data/qupath_project_binary/project.qpproj",
   "lastID": 6,
   "images": [
     {
@@ -127,7 +127,7 @@
         }
       },
       "entryID": 1,
-      "randomizedName": "7d1750d0-6501-4186-a8db-2c235085f9f9",
+      "randomizedName": "659978cf-2fab-4e42-ad9e-ef50495f0470",
       "imageName": "00a7fb880dc12c5de82df39b30533da9.tiff",
       "metadata": {},
       "tags": []
@@ -254,7 +254,7 @@
         }
       },
       "entryID": 2,
-      "randomizedName": "97b2c5ba-1bff-4a07-b0fc-4257ba4dfd91",
+      "randomizedName": "1a4004ad-92ac-4e00-9524-d3beee2b2153",
       "imageName": "00bbc1482301d16de3ff63238cfd0b34.tiff",
       "metadata": {},
       "tags": []
@@ -376,7 +376,7 @@
         }
       },
       "entryID": 4,
-      "randomizedName": "2600644e-a4dd-41cb-81b5-2ca772317990",
+      "randomizedName": "bb9e1aeb-9e77-4599-8a3c-f66564d7c3c4",
       "imageName": "006f6aa35a78965c92fffd1fbd53a058.tiff",
       "metadata": {},
       "tags": []
@@ -503,7 +503,7 @@
         }
       },
       "entryID": 6,
-      "randomizedName": "26eaeca4-0f03-4613-9983-032f4dfb6c8a",
+      "randomizedName": "863eefc3-3cbe-47ee-94a2-eb68bb5ab601",
       "imageName": "0018ae58b01bdadc8e347995b69f99aa.tiff",
       "metadata": {},
       "tags": []

@@ -30,8 +30,10 @@ Train vs val loss (same GuidedLoss = weighted CE + Dice):
 
 import os
 import argparse
+import copy
 import random
 import warnings
+import math
 from pathlib import Path
 from functools import partial
 
@@ -111,10 +113,10 @@ DEFAULT_CONFIG = {
     "num_classes"   : NUM_CLASSES,
     "num_workers"   : 4,
     "weight_decay"  : 1e-4,
-    "max_epochs"    : 100,
+    "max_epochs"    : 40,
     # Early stopping by macro-F1: if the best model appears around epoch 4 and does not improve,
     # this stops earlier than patience=30.
-    "patience"      : 18,
+    "patience"      : 12,
     # Slightly higher Dice weight for highly imbalanced tasks (F1 tracks class overlap).
     "dice_weight"   : 0.55,
     "ce_weight"     : 0.45,
@@ -122,8 +124,11 @@ DEFAULT_CONFIG = {
     # ViT-B/16: fits better in 8GB than ViT-L/H
     "batch_size"    : 6,
     "grad_accum_steps": 2,
-    # Slightly lower than 6e-5 to reduce oscillation after early epochs.
-    "learning_rate" : 4e-5,
+    # Lower decoder LR for pretrained CONCH stability (encoder uses LR/10).
+    "learning_rate" : 1.5e-5,
+    "use_cosine_schedule": True,
+    "warmup_pct": 0.07,
+    "cosine_min_lr_ratio": 0.01,
     # ReduceLROnPlateau: lower LR sooner when macro-F1 stalls (e.g., after ~4 epochs).
     "lr_plateau_patience": 3,
     "fpn_channels"  : 256,
@@ -134,6 +139,8 @@ DEFAULT_CONFIG = {
     "sampler_weight_gg4": 1.3,
     "sampler_weight_gg3": 1.8,
     "use_compile"   : None,
+    "use_ema"       : False,
+    "ema_decay"     : 0.999,
     "conch_checkpoint": None,   # None → CONCH_HF_CHECKPOINT
     "conch_hf_token" : None,
     "use_imagenet_norm": False,
@@ -165,8 +172,6 @@ _D4_TRANSFORMS = (
     "hflip_rot90",
     "vflip_rot90",
 )
-_MISSING = object()
-
 
 def resolve_normalization(use_imagenet_norm: bool):
     if use_imagenet_norm:
@@ -182,7 +187,16 @@ def resolve_normalization(use_imagenet_norm: bool):
 
 
 def _build_elastic_transform():
-    kwargs = dict(
+    """
+    Build a working ElasticTransform across Albumentations versions.
+
+    Newer Albumentations (>= 1.4) removed alpha_affine entirely; the
+    elastic displacement field provides the deformation. Older versions
+    require alpha_affine; we pass a small but non-zero value so the
+    affine perturbation actually contributes (the previous 0.0 fallback
+    silently disabled this component).
+    """
+    base_kwargs = dict(
         alpha=30,
         sigma=5,
         p=0.3,
@@ -191,37 +205,37 @@ def _build_elastic_transform():
     probe_image = np.zeros((16, 16, 3), dtype=np.uint8)
     probe_mask = np.zeros((16, 16), dtype=np.uint8)
 
-    def _candidate_kwargs(alpha_affine_marker):
-        probe_kwargs = dict(kwargs)
-        probe_kwargs["p"] = 1.0  # force execution during compatibility probing
-        final_kwargs = dict(kwargs)
-        if alpha_affine_marker is not _MISSING:
-            probe_kwargs["alpha_affine"] = alpha_affine_marker
-            final_kwargs["alpha_affine"] = alpha_affine_marker
-        return probe_kwargs, final_kwargs
+    # Attempt 1: modern Albumentations API (no alpha_affine)
+    try:
+        t = A.ElasticTransform(**base_kwargs)
+        probe_kwargs = dict(base_kwargs)
+        probe_kwargs["p"] = 1.0
+        A.ElasticTransform(**probe_kwargs)(image=probe_image, mask=probe_mask)
+        print("  [Aug] ElasticTransform: modern API (alpha=30, sigma=5, no alpha_affine).")
+        return t
+    except (TypeError, ValueError):
+        pass
 
-    candidates = (
-        ("alpha_affine=None", None),
-        ("alpha_affine=0.0", 0.0),
-        ("alpha_affine omitted", _MISSING),
-    )
-
-    last_error = None
-    for label, alpha_affine_marker in candidates:
+    # Attempt 2: legacy API with a MEANINGFUL alpha_affine value
+    # (previous fallback used 0.0 which silently disabled the affine effect)
+    for alpha_affine_val in (10.0, 5.0):
         try:
-            probe_kwargs, final_kwargs = _candidate_kwargs(alpha_affine_marker)
-            probe_transform = A.ElasticTransform(**probe_kwargs)
-            probe_transform(image=probe_image, mask=probe_mask)
-            if label != "alpha_affine=None":
-                print(
-                    "  [WARN] ElasticTransform does not support alpha_affine=None in this "
-                    f"Albumentations build; using {label} fallback."
-                )
-            return A.ElasticTransform(**final_kwargs)
-        except (TypeError, ValueError) as e:
-            last_error = e
+            legacy_kwargs = dict(base_kwargs, alpha_affine=alpha_affine_val)
+            t = A.ElasticTransform(**legacy_kwargs)
+            probe_kwargs = dict(legacy_kwargs, p=1.0)
+            A.ElasticTransform(**probe_kwargs)(image=probe_image, mask=probe_mask)
+            print(
+                f"  [Aug] ElasticTransform: legacy API with alpha_affine={alpha_affine_val} "
+                "(previous 0.0 fallback was a silent no-op)."
+            )
+            return t
+        except (TypeError, ValueError):
+            continue
 
-    raise RuntimeError("Unable to construct a compatible Albumentations ElasticTransform.") from last_error
+    raise RuntimeError(
+        "Unable to construct a working Albumentations ElasticTransform. "
+        "Check albumentations version: pip show albumentations"
+    )
 
 
 def parse_tta_scales(scales_text: str):
@@ -646,10 +660,91 @@ class SegmentationMetrics:
             "confusion_matrix": cm.copy(),
         }
 
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model parameters for use at validation
+    and checkpointing. Improves stability by smoothing the optimization
+    trajectory, particularly effective for folds with documented loss-
+    landscape pathology (e.g., SICAPv2 Val1 with epoch-9 GG5 ridge).
+
+    Decay 0.999 corresponds to an effective averaging window of ~1000
+    optimizer steps (~2-3 epochs at this batch size).
+
+    Buffers (BN running stats) are copied directly rather than averaged,
+    which is the standard approach since BN stats already have their own
+    momentum.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.ema = copy.deepcopy(model)
+        self.ema.eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for p_ema, p in zip(self.ema.parameters(), model.parameters()):
+            p_ema.data.mul_(d).add_(p.data, alpha=1.0 - d)
+        for b_ema, b in zip(self.ema.buffers(), model.buffers()):
+            b_ema.copy_(b)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Training & Val Epochs — identical to the original
 # ─────────────────────────────────────────────────────────────────────────────
-def train_one_epoch(model, loader, criterion, optimizer, scaler, device, grad_accum_steps: int = 1):
+def _trainable_model(model: nn.Module) -> nn.Module:
+    """
+    Return the underlying module whether or not the model has been wrapped
+    by torch.compile. The compile wrapper exposes the original module via
+    the `_orig_mod` attribute; if absent, the model itself is returned.
+    Used so EMA initialization captures the right parameter set, and so
+    saved state_dicts do not contain `_orig_mod.` prefixes.
+    """
+    return getattr(model, "_orig_mod", model)
+
+
+def build_cosine_warmup_scheduler(
+    optimizer,
+    total_steps: int,
+    warmup_pct: float = 0.07,
+    min_lr_ratio: float = 0.01,
+):
+    """
+    Returns a torch.optim.lr_scheduler.LambdaLR that:
+    - Linearly warms up from 0 to 1.0 over int(warmup_pct * total_steps) steps
+    - Then decays following half-cosine from 1.0 to min_lr_ratio over the
+      remaining steps
+    The lambda is applied multiplicatively to each param group's base LR,
+    so encoder/decoder LR ratio is preserved automatically.
+    """
+    warmup_steps = max(1, int(warmup_pct * total_steps))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scaler,
+    device,
+    grad_accum_steps: int = 1,
+    scheduler=None,
+    step_scheduler_per_batch: bool = False,
+    ema=None,
+    ema_source=None,
+):
     model.train()
     total_loss, num_batches = 0.0, 0
     accum = 0
@@ -673,6 +768,10 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, grad_ac
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            if step_scheduler_per_batch and scheduler is not None:
+                scheduler.step()
+            if ema is not None and ema_source is not None:
+                ema.update(ema_source)
             accum = 0
         pbar.set_postfix(loss=f"{loss.item():.4f}")
     if accum > 0:
@@ -681,6 +780,10 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, grad_ac
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        if step_scheduler_per_batch and scheduler is not None:
+            scheduler.step()
+        if ema is not None and ema_source is not None:
+            ema.update(ema_source)
     return total_loss / max(num_batches, 1)
 
 
@@ -806,6 +909,15 @@ def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool
         print(f"  [TTA] Validation enabled | D4=True | scales={tta_config['scales']}")
 
     model = build_model(config).to(device)
+    # EMA must be initialized BEFORE torch.compile wraps the model,
+    # since the EMA holds a deepcopy of the original parameters.
+    ema = None
+    if config.get("use_ema", False):
+        ema = ModelEMA(model, decay=float(config.get("ema_decay", 0.999)))
+        print(
+            f"  [EMA] enabled (decay={config.get('ema_decay', 0.999)}); "
+            "validation and checkpoint use EMA copy."
+        )
 
     use_compile = config.get("use_compile")
     if use_compile is None:
@@ -823,6 +935,7 @@ def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool
     elif not use_compile:
         print("  ℹ️ torch.compile disabled (recommended on Windows to save VRAM).")
 
+    ema_source = _trainable_model(model) if ema is not None else None
     criterion = GuidedLoss(config["class_weights"], config["dice_weight"], config["ce_weight"]).to(device)
 
     encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
@@ -833,10 +946,24 @@ def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool
     param_groups.append({"params": decoder_params, "lr": config["learning_rate"]})
     optimizer = torch.optim.AdamW(param_groups, weight_decay=config["weight_decay"])
 
-    lr_plat = int(config.get("lr_plateau_patience", 3))
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=lr_plat, min_lr=1e-7
-    )
+    use_cosine = config.get("use_cosine_schedule", True)
+    if use_cosine:
+        steps_per_epoch = max(1, len(train_loader) // max(1, int(config.get("grad_accum_steps", 1))))
+        total_optimizer_steps = steps_per_epoch * int(config["max_epochs"])
+        scheduler = build_cosine_warmup_scheduler(
+            optimizer,
+            total_steps=total_optimizer_steps,
+            warmup_pct=float(config.get("warmup_pct", 0.07)),
+            min_lr_ratio=float(config.get("cosine_min_lr_ratio", 0.01)),
+        )
+        scheduler_kind = "cosine_warmup"
+    else:
+        lr_plat = int(config.get("lr_plateau_patience", 3))
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=lr_plat, min_lr=1e-7
+        )
+        scheduler_kind = "reduce_on_plateau"
+    print(f"  [Scheduler] {scheduler_kind}")
     scaler    = GradScaler("cuda", enabled=(device.type == "cuda"))
 
     best_macro_f1, patience_counter, best_cm = 0.0, 0, None
@@ -851,16 +978,23 @@ def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler, device,
             grad_accum_steps=ga,
+            scheduler=scheduler,
+            step_scheduler_per_batch=(scheduler_kind == "cosine_warmup"),
+            ema=ema,
+            ema_source=ema_source,
         )
+        val_net = ema.ema if ema is not None else model
         val_loss, val_metrics = validate_one_epoch(
-            model, val_loader, criterion, device, tta_config=tta_config,
+            val_net, val_loader, criterion, device, tta_config=tta_config,
         )
 
         macro_f1 = val_metrics["macro_f1"]
-        scheduler.step(macro_f1)
+        if scheduler_kind == "reduce_on_plateau":
+            scheduler.step(macro_f1)
         ratio = val_loss / (train_loss + 1e-8)
-        print(f"  Train Loss: {train_loss:.4f}  |  Val Loss:   {val_loss:.4f}  |  Val/Train: {ratio:.3f}")
-        print(f"  Macro F1:   {macro_f1:.4f}")
+        val_tag = " (EMA)" if ema is not None else ""
+        print(f"  Train Loss: {train_loss:.4f}  |  Val Loss{val_tag}: {val_loss:.4f}  |  Val/Train: {ratio:.3f}")
+        print(f"  Macro F1{val_tag}: {macro_f1:.4f}")
         for i, name in enumerate(CLASS_NAMES):
             print(f"    {name} F1: {val_metrics['f1_per_class'][i]:.4f}")
 
@@ -872,6 +1006,7 @@ def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool
                 f"{fold_name}/val_loss": val_loss,
                 f"{fold_name}/val_train_loss_ratio": ratio,
                 f"{fold_name}/macro_f1": macro_f1,
+                f"{fold_name}/val_source": "ema" if ema is not None else "raw",
                 "epoch": epoch,
                 f"{fold_name}/lr_encoder": enc_lr,
                 f"{fold_name}/lr_decoder": dec_lr,
@@ -882,8 +1017,10 @@ def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool
 
         if macro_f1 > best_macro_f1:
             best_macro_f1, best_cm, patience_counter = macro_f1, val_metrics["confusion_matrix"], 0
-            torch.save(model.state_dict(), out_dir / f"best_{fold_name}_{macro_f1:.4f}.pth")
-            print(f"  ✓ Model saved (Macro F1={macro_f1:.4f})")
+            to_save = ema.ema.state_dict() if ema is not None else _trainable_model(model).state_dict()
+            torch.save(to_save, out_dir / f"best_{fold_name}_{macro_f1:.4f}.pth")
+            ckpt_source = "EMA" if ema is not None else "raw"
+            print(f"  ✓ Model saved [{ckpt_source}] (Macro F1={macro_f1:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= config["patience"]:
@@ -968,6 +1105,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None, help="Micro-batch.")
     parser.add_argument("--grad-accum", type=int, default=None, metavar="K",
                         help="Acumular K micro-batches (by default 2).")
+    parser.add_argument("--learning-rate", type=float, default=None,
+                        help="Decoder LR (encoder = LR/10). Default 1.5e-5 based on Run C analysis; previous default was 4e-5.")
+    parser.add_argument("--max-epochs", type=int, default=None,
+                        help="Maximum training epochs. Default 40 with cosine schedule; was 100 with plateau.")
+    parser.add_argument("--patience", type=int, default=None,
+                        help="Early-stopping patience in epochs. Default 12.")
     parser.add_argument("--no-weighted-sampler", action="store_true")
     parser.add_argument("--sampler-gg5", type=float, default=None, metavar="W",
                         help="Peso sampler tiles con GG5 (default config).")
@@ -975,16 +1118,49 @@ def main():
                         help="Peso sampler tiles con GG4 (sin GG5; default config).")
     parser.add_argument("--sampler-gg3", type=float, default=None, metavar="W",
                         help="Peso sampler tiles con GG3 (sin GG4/GG5; default config).")
+    parser.add_argument(
+        "--class-weights",
+        type=str,
+        default=None,
+        metavar="W1,W2,W3,W4",
+        help=(
+            "Comma-separated CE class weights for [NC, GG3, GG4, GG5], "
+            "e.g. '1.0,2.5,2.04,2.81' for cube-root-inv-freq instead of "
+            "the default sqrt-inv-freq [1.0, 3.586, 2.573, 4.21]. "
+            "Use to address GG3 over-prediction documented in Run C/D "
+            "confusion matrices (GG3 Prec=0.56-0.60, Rec=0.71-0.74)."
+        ),
+    )
     parser.add_argument("--sampler-replacement", action="store_true",
                         help="Re-enable WeightedRandomSampler replacement=True for ablation/backward compatibility.")
     parser.add_argument("--imagenet-norm", action="store_true",
                         help="Use ImageNet normalization instead of the CONCH/CLIP defaults (ablation).")
     parser.add_argument("--no-color-aug", action="store_true",
                         help="Disable ColorJitter + ElasticTransform in train augmentations.")
+    parser.add_argument(
+        "--ema",
+        action="store_true",
+        help="Enable Exponential Moving Average of weights. Validation and "
+             "checkpointing both use the EMA copy. Targets Val1 instability."
+    )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=None,
+        metavar="D",
+        help="EMA decay factor (default: 0.999). Larger = slower averaging."
+    )
     parser.add_argument("--tta", action="store_true",
                         help="Enable D4 test-time augmentation during validation.")
     parser.add_argument("--tta-scales", type=str, default="1.0",
                         help='Comma-separated TTA scales for validation, e.g. "0.875,1.0,1.125". Ignored unless --tta is set.')
+    parser.add_argument("--scheduler", choices=["cosine", "plateau"],
+                        default="cosine",
+                        help="LR scheduler: cosine annealing with warmup (new default) or legacy ReduceLROnPlateau (for ablation/backward compatibility).")
+    parser.add_argument("--warmup-pct", type=float, default=0.07,
+                        help="Fraction of total optimizer steps used for linear LR warmup (cosine schedule only).")
+    parser.add_argument("--cosine-min-lr-ratio", type=float, default=0.01,
+                        help="Minimum LR as a fraction of base LR at the end of cosine annealing (cosine schedule only).")
     parser.add_argument("--compile", action="store_true", help="Force torch.compile (Windows: can fail or use more VRAM).")
     parser.add_argument("--no-compile", action="store_true", help="Desactivar torch.compile.")
     parser.add_argument("--no-wandb", action="store_true", help="Do not log to Weights & Biases.")
@@ -1028,6 +1204,9 @@ def main():
     config["color_aug_enabled"] = not args.no_color_aug
     config["sampler_replacement"] = args.sampler_replacement
     config["tta_enabled"] = args.tta
+    config["use_cosine_schedule"] = (args.scheduler == "cosine")
+    config["warmup_pct"] = args.warmup_pct
+    config["cosine_min_lr_ratio"] = args.cosine_min_lr_ratio
     if args.tta:
         try:
             config["tta_scales"] = parse_tta_scales(args.tta_scales)
@@ -1045,6 +1224,12 @@ def main():
         config["batch_size"] = args.batch_size
     if args.grad_accum is not None:
         config["grad_accum_steps"] = max(1, args.grad_accum)
+    if args.learning_rate is not None:
+        config["learning_rate"] = args.learning_rate
+    if args.max_epochs is not None:
+        config["max_epochs"] = args.max_epochs
+    if args.patience is not None:
+        config["patience"] = args.patience
     if args.no_weighted_sampler:
         config["use_weighted_sampler"] = False
     if args.sampler_gg5 is not None:
@@ -1059,6 +1244,23 @@ def main():
         config["use_compile"] = False
     elif args.compile:
         config["use_compile"] = True
+    if args.ema:
+        config["use_ema"] = True
+    if args.ema_decay is not None:
+        config["ema_decay"] = float(args.ema_decay)
+    if args.class_weights is not None:
+        try:
+            parsed = [float(x.strip()) for x in args.class_weights.split(",") if x.strip()]
+        except ValueError as e:
+            parser.error(f"--class-weights parse error: {e}")
+        if len(parsed) != NUM_CLASSES:
+            parser.error(
+                f"--class-weights must provide exactly {NUM_CLASSES} values "
+                f"in order [NC, GG3, GG4, GG5], got {len(parsed)}."
+            )
+        if any(w <= 0 for w in parsed):
+            parser.error("--class-weights must all be > 0.")
+        config["class_weights"] = parsed
 
     config["output_dir"] = Path(args.output_dir).resolve() if args.output_dir else OUTPUT_DIR
     print(f"Checkpoints -> {config['output_dir']}")
@@ -1068,9 +1270,12 @@ def main():
         f"CONCH train: micro_batch={config['batch_size']} × accum={config.get('grad_accum_steps', 1)} "
         f"≈ {eff} | weighted_sampler={config.get('use_weighted_sampler')} | lr={config['learning_rate']}"
     )
+    weight_source = "custom (--class-weights)" if args.class_weights is not None else "sqrt-inv freq partition"
     print(
-        "  class_weights (CE, sqrt-inv freq partition): "
+        f"  class_weights (CE, {weight_source}): "
         f"{config['class_weights']} | dice/ce: {config['dice_weight']}/{config['ce_weight']} | "
+        f"scheduler={args.scheduler} | warmup_pct={config['warmup_pct']} | "
+        f"cosine_min_lr_ratio={config['cosine_min_lr_ratio']} | "
         f"lr_plateau_patience={config.get('lr_plateau_patience', 3)}"
     )
     print(
@@ -1093,9 +1298,13 @@ def main():
         "weight_decay": config["weight_decay"],
         "max_epochs": config["max_epochs"],
         "patience": config["patience"],
+        "scheduler_kind": args.scheduler,
+        "warmup_pct": config["warmup_pct"],
+        "cosine_min_lr_ratio": config["cosine_min_lr_ratio"],
         "dice_weight": config["dice_weight"],
         "ce_weight": config["ce_weight"],
         "class_weights": list(config["class_weights"]),
+        "class_weights_source": "custom" if args.class_weights is not None else "sqrt_inv_freq",
         "unfreeze_last": config["unfreeze_last"],
         "weighted_sampler": config.get("use_weighted_sampler", False),
         "sampler_weight_gg5": config.get("sampler_weight_gg5"),
@@ -1107,6 +1316,8 @@ def main():
         "color_aug_enabled": config.get("color_aug_enabled", True),
         "tta_enabled": config.get("tta_enabled", False),
         "tta_scales": list(config.get("tta_scales", (1.0,))),
+        "use_ema": config.get("use_ema", False),
+        "ema_decay": config.get("ema_decay", 0.999),
         "imagenet_norm": config.get("use_imagenet_norm", False),
         "norm_source": "imagenet" if config.get("use_imagenet_norm", False) else "conch_clip",
         "conch_checkpoint": config.get("conch_checkpoint") or CONCH_HF_CHECKPOINT,
