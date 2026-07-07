@@ -55,7 +55,12 @@ from inspect_pandas_masks import (  # type: ignore
     read_tiff_level,
     resize_image,
 )
-from training_conch_final import CONCHSegModel
+from wsi_resolution import choose_resolution_plan, resize_to_scale
+
+try:
+    from training_conch_final import CONCHSegModel
+except ModuleNotFoundError:
+    from training_conchv2 import CONCHSegModel
 
 
 cv2.setNumThreads(0)
@@ -95,7 +100,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blend-mode", type=str, default="gaussian_sum", choices=("gaussian_sum", "overwrite"))
     parser.add_argument("--gaussian-sigma-scale", type=float, default=4.0)
     parser.add_argument("--target-magnification", type=float, default=10.0)
-    parser.add_argument("--source-magnification", type=float, default=40.0)
+    parser.add_argument(
+        "--target-mpp",
+        type=float,
+        default=None,
+        help="Target microns per pixel. If omitted, target_magnification is converted with 10/mag.",
+    )
+    parser.add_argument(
+        "--source-magnification",
+        type=float,
+        default=None,
+        help="Fallback source magnification only when TIFF resolution tags do not provide mpp.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--thumb-size", type=int, default=1024)
@@ -234,31 +250,6 @@ def discover_cases(
             )
         raise RuntimeError("No WSI cases found for SICAP inference.")
     return cases
-
-
-def level_downsamples(structure: Dict[str, object]) -> List[float]:
-    level_shapes = structure["level_shapes"]
-    base_h, base_w = level_shapes[0][0], level_shapes[0][1]
-    factors: List[float] = []
-    for shape in level_shapes:
-        h, w = shape[0], shape[1]
-        factors.append(float((base_h / h + base_w / w) / 2.0))
-    return factors
-
-
-def choose_level_for_magnification(
-    structure: Dict[str, object],
-    source_magnification: float,
-    target_magnification: float,
-) -> Tuple[int, float]:
-    desired_downsample = float(source_magnification) / float(target_magnification)
-    factors = level_downsamples(structure)
-    level_index = min(
-        range(len(factors)),
-        key=lambda idx: abs(math.log(factors[idx] + 1e-8) - math.log(desired_downsample + 1e-8)),
-    )
-    effective_magnification = float(source_magnification) / factors[level_index]
-    return level_index, effective_magnification
 
 
 def load_wsi_level(case: CaseInfo, level_index: int) -> np.ndarray:
@@ -434,7 +425,8 @@ def run_case(
     batch_size: int,
     device: torch.device,
     target_magnification: float,
-    source_magnification: float,
+    source_magnification: Optional[float],
+    target_mpp: Optional[float],
     tissue_threshold: float,
     tissue_mask_size: int,
     tissue_gray_threshold: float,
@@ -451,20 +443,35 @@ def run_case(
         "tissue_mask_seconds": 0.0,
         "tile_selection_seconds": 0.0,
         "preprocess_seconds": 0.0,
+        "model_forward_seconds": 0.0,
+        "postprocess_transfer_seconds": 0.0,
         "forward_seconds": 0.0,
+        "stitch_tiles_seconds": 0.0,
+        "stitch_merge_seconds": 0.0,
         "stitch_seconds": 0.0,
         "write_seconds": 0.0,
+        "summary_stats_seconds": 0.0,
     }
 
-    level_index, effective_mag = choose_level_for_magnification(
+    plan = choose_resolution_plan(
         case.wsi_structure,
-        source_magnification,
-        target_magnification,
+        target_magnification=target_magnification,
+        source_magnification=source_magnification,
+        target_mpp=target_mpp,
     )
-    LOGGER.info("Case %s -> level %s (effective %.2fx)", case.case_id, level_index, effective_mag)
+    LOGGER.info(
+        "Case %s -> level %s, read_scale %.3f, output %.2fx (%.3f mpp), source=%s",
+        case.case_id,
+        plan.level_index,
+        plan.read_scale,
+        plan.output_magnification or target_magnification,
+        plan.target_mpp or 0.0,
+        plan.source,
+    )
 
     t0 = time.perf_counter()
-    wsi = load_wsi_level(case, level_index)
+    wsi = load_wsi_level(case, plan.level_index)
+    wsi = resize_to_scale(wsi, plan.read_scale, is_mask=False)
     timings["read_level_seconds"] = time.perf_counter() - t0
 
     t_mask = time.perf_counter()
@@ -487,7 +494,7 @@ def run_case(
     )
     timings["tile_selection_seconds"] = time.perf_counter() - t_tiles
     if not tiles:
-        raise RuntimeError(f"No tissue tiles found for case {case.case_id} at level {level_index}")
+        raise RuntimeError(f"No tissue tiles found for case {case.case_id} at level {plan.level_index}")
 
     case_dir = output_dir / case.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -519,11 +526,17 @@ def run_case(
                 torch.cuda.synchronize()
             t_fwd = time.perf_counter()
             logits = model(batch_tensor)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            timings["model_forward_seconds"] += time.perf_counter() - t_fwd
+
+            t_post = time.perf_counter()
             probs = torch.softmax(logits, dim=1).cpu().numpy().astype(np.float32)
             preds = probs.argmax(axis=1).astype(np.uint8)
             if device.type == "cuda":
                 torch.cuda.synchronize()
-            timings["forward_seconds"] += time.perf_counter() - t_fwd
+            timings["postprocess_transfer_seconds"] += time.perf_counter() - t_post
+            timings["forward_seconds"] = timings["model_forward_seconds"] + timings["postprocess_transfer_seconds"]
 
             t_stitch = time.perf_counter()
             for b_idx, tile in enumerate(batch_tiles):
@@ -553,8 +566,11 @@ def run_case(
                         "tile_index": idx,
                         "x": x0,
                         "y": y0,
-                        "level_index": level_index,
-                        "effective_magnification": effective_mag,
+                        "level_index": plan.level_index,
+                        "level_downsample": plan.level_downsample,
+                        "output_downsample": plan.output_downsample,
+                        "read_scale": plan.read_scale,
+                        "effective_magnification": plan.output_magnification,
                         "tissue_fraction": float(tile["tissue_fraction"]),
                         "pred_tumor_fraction": pred_tumor_fraction,
                         "majority_class_id": majority_class,
@@ -562,14 +578,18 @@ def run_case(
                         **{f"pixels_{CLASS_NAMES[class_idx]}": int(counts[class_idx]) for class_idx in range(len(CLASS_NAMES))},
                     }
                 )
-            timings["stitch_seconds"] += time.perf_counter() - t_stitch
+            stitch_tiles_elapsed = time.perf_counter() - t_stitch
+            timings["stitch_tiles_seconds"] += stitch_tiles_elapsed
+            timings["stitch_seconds"] += stitch_tiles_elapsed
 
     if effective_blend_mode == "gaussian_sum":
         t_merge = time.perf_counter()
         norm = np.clip(weight_accumulator.astype(np.float32), 1e-8, None)
         pred_canvas = (prob_accumulator.astype(np.float32) / norm[None, :, :]).argmax(axis=0).astype(np.uint8)
         pred_canvas[coverage == 0] = 0
-        timings["stitch_seconds"] += time.perf_counter() - t_merge
+        stitch_merge_elapsed = time.perf_counter() - t_merge
+        timings["stitch_merge_seconds"] += stitch_merge_elapsed
+        timings["stitch_seconds"] += stitch_merge_elapsed
 
     t_write = time.perf_counter()
     tile_df = pd.DataFrame(tile_rows)
@@ -590,12 +610,14 @@ def run_case(
     )
     timings["write_seconds"] = time.perf_counter() - t_write
 
+    t_summary_stats = time.perf_counter()
     class_pixel_counts = {
         CLASS_NAMES[class_idx]: int((pred_canvas == class_idx).sum())
         for class_idx in range(len(CLASS_NAMES))
     }
     covered_pixels = int((coverage > 0).sum())
     tumor_pixels = int((pred_canvas > 0).sum())
+    timings["summary_stats_seconds"] = time.perf_counter() - t_summary_stats
     total_case_seconds = time.perf_counter() - case_start
 
     summary = {
@@ -604,11 +626,19 @@ def run_case(
         "data_provider": case.data_provider,
         "isup_grade": case.isup_grade,
         "gleason_score": case.gleason_score,
-        "level_index": level_index,
-        "effective_magnification": effective_mag,
+        **plan.as_dict(),
+        "effective_magnification": plan.output_magnification,
         "tile_size": tile_size,
         "stride": stride,
         "blend_mode": effective_blend_mode,
+        "mosaic_height": int(h),
+        "mosaic_width": int(w),
+        "mosaic_pixels": int(h * w),
+        "gaussian_accumulator_mib": (
+            round(((len(CLASS_NAMES) * h * w + h * w) * np.dtype(np.float16).itemsize) / (1024 ** 2), 2)
+            if effective_blend_mode == "gaussian_sum"
+            else 0.0
+        ),
         "num_tissue_tiles": int(len(tile_rows)),
         "num_predicted_tumor_tiles": int(len(tumor_tiles_df)),
         "predicted_tumor_tile_fraction_threshold": float(min_predicted_tumor_fraction),
@@ -650,9 +680,18 @@ def timing_rows(case_summaries: Sequence[Dict[str, object]]) -> List[Dict[str, o
                 "tissue_mask_seconds": timings.get("tissue_mask_seconds"),
                 "tile_selection_seconds": timings.get("tile_selection_seconds"),
                 "preprocess_seconds": timings.get("preprocess_seconds"),
+                "model_forward_seconds": timings.get("model_forward_seconds"),
+                "postprocess_transfer_seconds": timings.get("postprocess_transfer_seconds"),
                 "forward_seconds": timings.get("forward_seconds"),
+                "stitch_tiles_seconds": timings.get("stitch_tiles_seconds"),
+                "stitch_merge_seconds": timings.get("stitch_merge_seconds"),
                 "stitch_seconds": timings.get("stitch_seconds"),
                 "write_seconds": timings.get("write_seconds"),
+                "summary_stats_seconds": timings.get("summary_stats_seconds"),
+                "mosaic_width": summary.get("mosaic_width"),
+                "mosaic_height": summary.get("mosaic_height"),
+                "mosaic_pixels": summary.get("mosaic_pixels"),
+                "gaussian_accumulator_mib": summary.get("gaussian_accumulator_mib"),
                 "num_tissue_tiles": summary["num_tissue_tiles"],
                 "tiles_per_second_total": throughput.get("tiles_per_second_total"),
                 "tiles_per_second_forward_only": throughput.get("tiles_per_second_forward_only"),
@@ -693,6 +732,7 @@ def main() -> None:
             device=device,
             target_magnification=args.target_magnification,
             source_magnification=args.source_magnification,
+            target_mpp=args.target_mpp,
             tissue_threshold=args.tissue_threshold,
             tissue_mask_size=args.tissue_mask_size,
             tissue_gray_threshold=args.tissue_gray_threshold,
@@ -714,7 +754,8 @@ def main() -> None:
         "checkpoint_path": str(checkpoint_path),
         "device": str(device),
         "target_magnification": float(args.target_magnification),
-        "source_magnification": float(args.source_magnification),
+        "target_mpp": None if args.target_mpp is None else float(args.target_mpp),
+        "source_magnification": None if args.source_magnification is None else float(args.source_magnification),
         "tile_size": int(args.tile_size),
         "stride": int(args.stride),
         "batch_size": int(args.batch_size),

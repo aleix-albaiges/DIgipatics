@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -56,7 +55,12 @@ from inspect_pandas_masks import (  # type: ignore
     read_tiff_level,
     resize_image,
 )
-from training_conch_final import CONCHSegModel
+from wsi_resolution import choose_resolution_plan, resize_to_scale
+
+try:
+    from training_conch_final import CONCHSegModel
+except ModuleNotFoundError:
+    from training_conchv2 import CONCHSegModel
 
 
 cv2.setNumThreads(0)
@@ -100,7 +104,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blend-mode", type=str, default="gaussian_sum", choices=("gaussian_sum", "overwrite"))
     parser.add_argument("--gaussian-sigma-scale", type=float, default=4.0)
     parser.add_argument("--target-magnification", type=float, default=10.0)
-    parser.add_argument("--source-magnification", type=float, default=40.0)
+    parser.add_argument(
+        "--target-mpp",
+        type=float,
+        default=None,
+        help="Target microns per pixel. If omitted, target_magnification is converted with 10/mag.",
+    )
+    parser.add_argument(
+        "--source-magnification",
+        type=float,
+        default=None,
+        help="Fallback source magnification only when TIFF resolution tags do not provide mpp.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--thumb-size", type=int, default=1024)
@@ -203,31 +218,6 @@ def discover_cases(
     return cases
 
 
-def level_downsamples(structure: Dict[str, object]) -> List[float]:
-    level_shapes = structure["level_shapes"]
-    base_h, base_w = level_shapes[0][0], level_shapes[0][1]
-    factors: List[float] = []
-    for shape in level_shapes:
-        h, w = shape[0], shape[1]
-        factors.append(float((base_h / h + base_w / w) / 2.0))
-    return factors
-
-
-def choose_level_for_magnification(
-    structure: Dict[str, object],
-    source_magnification: float,
-    target_magnification: float,
-) -> Tuple[int, float]:
-    desired_downsample = float(source_magnification) / float(target_magnification)
-    factors = level_downsamples(structure)
-    level_index = min(
-        range(len(factors)),
-        key=lambda idx: abs(math.log(factors[idx] + 1e-8) - math.log(desired_downsample + 1e-8)),
-    )
-    effective_magnification = float(source_magnification) / factors[level_index]
-    return level_index, effective_magnification
-
-
 def load_wsi_level(case: CaseInfo, level_index: int) -> np.ndarray:
     wsi = read_tiff_level(case.wsi_path, level_index)
     if wsi.ndim == 2:
@@ -322,7 +312,8 @@ def run_case(
     batch_size: int,
     device: torch.device,
     target_magnification: float,
-    source_magnification: float,
+    source_magnification: Optional[float],
+    target_mpp: Optional[float],
     tissue_threshold: float,
     thumb_size: int,
     blend_mode: str,
@@ -339,15 +330,25 @@ def run_case(
         "write_seconds": 0.0,
     }
 
-    level_index, effective_mag = choose_level_for_magnification(
+    plan = choose_resolution_plan(
         case.wsi_structure,
-        source_magnification,
-        target_magnification,
+        target_magnification=target_magnification,
+        source_magnification=source_magnification,
+        target_mpp=target_mpp,
     )
-    LOGGER.info("Case %s -> level %s (effective %.2fx)", case.case_id, level_index, effective_mag)
+    LOGGER.info(
+        "Case %s -> level %s, read_scale %.3f, output %.2fx (%.3f mpp), source=%s",
+        case.case_id,
+        plan.level_index,
+        plan.read_scale,
+        plan.output_magnification or target_magnification,
+        plan.target_mpp or 0.0,
+        plan.source,
+    )
 
     t0 = time.perf_counter()
-    wsi = load_wsi_level(case, level_index)
+    wsi = load_wsi_level(case, plan.level_index)
+    wsi = resize_to_scale(wsi, plan.read_scale, is_mask=False)
     timings["read_level_seconds"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
@@ -359,7 +360,7 @@ def run_case(
     )
     timings["tile_selection_seconds"] = time.perf_counter() - t1
     if not tiles:
-        raise RuntimeError(f"No tissue tiles found for case {case.case_id} at level {level_index}")
+        raise RuntimeError(f"No tissue tiles found for case {case.case_id} at level {plan.level_index}")
 
     case_dir = output_dir / case.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -425,8 +426,11 @@ def run_case(
                         "tile_index": idx,
                         "x": x0,
                         "y": y0,
-                        "level_index": level_index,
-                        "effective_magnification": effective_mag,
+                        "level_index": plan.level_index,
+                        "level_downsample": plan.level_downsample,
+                        "output_downsample": plan.output_downsample,
+                        "read_scale": plan.read_scale,
+                        "effective_magnification": plan.output_magnification,
                         "tissue_fraction": float(tile["tissue_fraction"]),
                         "pred_tumor_fraction": pred_tumor_fraction,
                         "majority_class_id": majority_class,
@@ -473,8 +477,8 @@ def run_case(
         "data_provider": case.data_provider,
         "isup_grade": case.isup_grade,
         "gleason_score": case.gleason_score,
-        "level_index": level_index,
-        "effective_magnification": effective_mag,
+        **plan.as_dict(),
+        "effective_magnification": plan.output_magnification,
         "tile_size": tile_size,
         "stride": stride,
         "blend_mode": effective_blend_mode,
@@ -529,6 +533,7 @@ def main() -> None:
             device=device,
             target_magnification=args.target_magnification,
             source_magnification=args.source_magnification,
+            target_mpp=args.target_mpp,
             tissue_threshold=args.tissue_threshold,
             thumb_size=args.thumb_size,
             blend_mode=args.blend_mode,
@@ -543,7 +548,8 @@ def main() -> None:
         "checkpoint_path": str(checkpoint_path),
         "device": str(device),
         "target_magnification": float(args.target_magnification),
-        "source_magnification": float(args.source_magnification),
+        "target_mpp": None if args.target_mpp is None else float(args.target_mpp),
+        "source_magnification": None if args.source_magnification is None else float(args.source_magnification),
         "tile_size": int(args.tile_size),
         "stride": int(args.stride),
         "batch_size": int(args.batch_size),

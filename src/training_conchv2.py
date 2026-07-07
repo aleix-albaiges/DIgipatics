@@ -19,6 +19,7 @@ Usage:
     python src/training_conchv2.py --hf-token $env:HF_TOKEN   # optional if CLI login is unavailable
     python src/training_conchv2.py --output-dir PATH\\checkpoints   # override .pth output folder
     python src/training_conchv2.py --seed 42 --fold Val1 --unfreeze-last 2
+    python src/training_conchv2.py --final-train --max-epochs 18 --no-wandb
 
 Train vs val loss (same GuidedLoss = weighted CE + Dice):
     - Both use the same class_weights; the loss is not a "probability" but a weighted sum.
@@ -31,6 +32,7 @@ Train vs val loss (same GuidedLoss = weighted CE + Dice):
 import os
 import argparse
 import copy
+import json
 import random
 import warnings
 import math
@@ -352,15 +354,65 @@ def get_val_transforms(norm_mean=None, norm_std=None):
     ])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data Loading — identical to the original
+# Data Loading
 # ─────────────────────────────────────────────────────────────────────────────
-def get_fold_dataloaders(fold_name: str, config: dict):
-    fold_dir = PARTITION_DIR / "Validation" / fold_name
-    train_df = pd.read_excel(fold_dir / "Train.xlsx")
-    val_df   = pd.read_excel(fold_dir / "Test.xlsx")
-    train_names = train_df["image_name"].tolist()
-    val_names   = val_df["image_name"].tolist()
+def _dedupe_preserve_order(items: list) -> list:
+    seen = set()
+    unique = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
 
+
+def _read_split_image_names(fold_name: str, split_filename: str) -> list:
+    split_path = PARTITION_DIR / "Validation" / fold_name / split_filename
+    df = pd.read_excel(split_path)
+    if "image_name" not in df.columns:
+        raise KeyError(f"{split_path} does not contain an 'image_name' column.")
+    return df["image_name"].dropna().astype(str).tolist()
+
+
+def collect_final_train_names(fold_names: list) -> tuple[list, dict]:
+    all_names = []
+    source_counts = {}
+    for fold_name in fold_names:
+        for split_filename in ("Train.xlsx", "Test.xlsx"):
+            names = _read_split_image_names(fold_name, split_filename)
+            source_key = f"{fold_name}/{split_filename}"
+            source_counts[source_key] = len(names)
+            all_names.extend(names)
+
+    unique_names = _dedupe_preserve_order(all_names)
+    return unique_names, {
+        "folds": list(fold_names),
+        "source_counts": source_counts,
+        "total_rows_before_dedup": len(all_names),
+        "unique_images": len(unique_names),
+        "duplicates_removed": len(all_names) - len(unique_names),
+    }
+
+
+def _dataloader_kwargs(config: dict):
+    workers = int(os.environ.get("SLURM_CPUS_PER_TASK", config["num_workers"]))
+    kwargs = {"persistent_workers": True, "prefetch_factor": 4} if workers > 0 else {}
+
+    seed = int(config.get("seed", DEFAULT_SEED))
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    winit = partial(_worker_init_fn, base_seed=seed) if workers > 0 else None
+    dl_common = dict(
+        num_workers=workers,
+        pin_memory=True,
+        generator=gen,
+        worker_init_fn=winit,
+    )
+    return dl_common, kwargs
+
+
+def make_train_dataloader(train_names: list, config: dict, label: str = "train"):
     norm_mean = config.get("norm_mean", CONCH_NORM_MEAN)
     norm_std = config.get("norm_std", CONCH_NORM_STD)
     train_ds = SICAPv2Dataset(
@@ -373,26 +425,7 @@ def get_fold_dataloaders(fold_name: str, config: dict):
             color_aug_enabled=config.get("color_aug_enabled", True),
         ),
     )
-    val_ds = SICAPv2Dataset(
-        val_names,
-        IMAGES_DIR,
-        MASKS_DIR,
-        transform=get_val_transforms(norm_mean=norm_mean, norm_std=norm_std),
-    )
-
-    workers = int(os.environ.get("SLURM_CPUS_PER_TASK", config["num_workers"]))
-    kwargs  = {"persistent_workers": True, "prefetch_factor": 4} if workers > 0 else {}
-
-    seed = int(config.get("seed", DEFAULT_SEED))
-    gen = torch.Generator()
-    gen.manual_seed(seed)
-    winit = partial(_worker_init_fn, base_seed=seed) if workers > 0 else None
-    dl_common = dict(
-        num_workers=workers,
-        pin_memory=True,
-        generator=gen,
-        worker_init_fn=winit,
-    )
+    dl_common, kwargs = _dataloader_kwargs(config)
 
     if config.get("use_weighted_sampler", False):
         w5 = float(config["sampler_weight_gg5"])
@@ -403,8 +436,8 @@ def get_fold_dataloaders(fold_name: str, config: dict):
         n4 = sum(1 for x in sw if x == w4)
         n3 = sum(1 for x in sw if x == w3)
         print(
-            f"  [Sampler] train={len(train_names)} | GG5×{w5}={n5} | "
-            f"GG4×{w4}={n4} | GG3×{w3}={n3} | "
+            f"  [Sampler] {label}={len(train_names)} | GG5x{w5}={n5} | "
+            f"GG4x{w4}={n4} | GG3x{w3}={n3} | "
             f"replacement={config.get('sampler_replacement', False)}"
         )
         sampler = WeightedRandomSampler(
@@ -412,19 +445,39 @@ def get_fold_dataloaders(fold_name: str, config: dict):
             num_samples=len(train_names),
             replacement=config.get("sampler_replacement", False),
         )
-        train_loader = DataLoader(
+        return DataLoader(
             train_ds, batch_size=config["batch_size"], sampler=sampler,
             drop_last=True, **dl_common, **kwargs,
         )
-    else:
-        train_loader = DataLoader(
-            train_ds, batch_size=config["batch_size"], shuffle=True,
-            drop_last=True, **dl_common, **kwargs,
-        )
-    val_loader = DataLoader(
+
+    return DataLoader(
+        train_ds, batch_size=config["batch_size"], shuffle=True,
+        drop_last=True, **dl_common, **kwargs,
+    )
+
+
+def make_val_dataloader(val_names: list, config: dict):
+    norm_mean = config.get("norm_mean", CONCH_NORM_MEAN)
+    norm_std = config.get("norm_std", CONCH_NORM_STD)
+    val_ds = SICAPv2Dataset(
+        val_names,
+        IMAGES_DIR,
+        MASKS_DIR,
+        transform=get_val_transforms(norm_mean=norm_mean, norm_std=norm_std),
+    )
+    dl_common, kwargs = _dataloader_kwargs(config)
+    return DataLoader(
         val_ds, batch_size=config["batch_size"], shuffle=False,
         **dl_common, **kwargs,
     )
+
+
+def get_fold_dataloaders(fold_name: str, config: dict):
+    train_names = _read_split_image_names(fold_name, "Train.xlsx")
+    val_names = _read_split_image_names(fold_name, "Test.xlsx")
+
+    train_loader = make_train_dataloader(train_names, config, label="train")
+    val_loader = make_val_dataloader(val_names, config)
     return train_loader, val_loader
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1031,6 +1084,168 @@ def train_fold(fold_name: str, config: dict, device: torch.device, dry_run: bool
 
     return {"fold": fold_name, "best_macro_f1": best_macro_f1, "best_cm": best_cm}
 
+
+def train_final_model(
+    fold_names: list,
+    config: dict,
+    device: torch.device,
+    dry_run: bool = False,
+    use_wandb: bool = True,
+):
+    print(f"\n{'='*60}\n  FINAL TRAINING: grouped folds\n{'='*60}")
+    train_names, data_summary = collect_final_train_names(fold_names)
+    print(
+        f"  [Final data] folds={fold_names} | unique_images={data_summary['unique_images']} | "
+        f"rows_before_dedup={data_summary['total_rows_before_dedup']} | "
+        f"duplicates_removed={data_summary['duplicates_removed']}"
+    )
+    for source_key, count in data_summary["source_counts"].items():
+        print(f"    {source_key}: {count}")
+
+    train_loader = make_train_dataloader(train_names, config, label="final_train")
+
+    model = build_model(config).to(device)
+    ema = None
+    if config.get("use_ema", False):
+        ema = ModelEMA(model, decay=float(config.get("ema_decay", 0.999)))
+        print(
+            f"  [EMA] enabled (decay={config.get('ema_decay', 0.999)}); "
+            "final checkpoint uses EMA copy."
+        )
+
+    use_compile = config.get("use_compile")
+    if use_compile is None:
+        import platform
+        use_compile = platform.system() != "Windows"
+    if use_compile and int(torch.__version__.split('.')[0]) >= 2:
+        try:
+            print("  ⏳ Compiling model with torch.compile...")
+            import platform
+            backend = "inductor" if platform.system() != "Windows" else "aot_eager"
+            model = torch.compile(model, backend=backend)
+            print("  ✅ torch.compile enabled.")
+        except Exception as e:
+            print(f"  ⚠️ torch.compile unavailable: {e}")
+    elif not use_compile:
+        print("  ℹ️ torch.compile disabled (recommended on Windows to save VRAM).")
+
+    ema_source = _trainable_model(model) if ema is not None else None
+    criterion = GuidedLoss(config["class_weights"], config["dice_weight"], config["ce_weight"]).to(device)
+
+    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    decoder_params = list(model.decoder.parameters())
+    param_groups = []
+    if encoder_params:
+        param_groups.append({"params": encoder_params, "lr": config["learning_rate"] / 10})
+    param_groups.append({"params": decoder_params, "lr": config["learning_rate"]})
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=config["weight_decay"])
+
+    use_cosine = config.get("use_cosine_schedule", True)
+    if use_cosine:
+        steps_per_epoch = max(1, len(train_loader) // max(1, int(config.get("grad_accum_steps", 1))))
+        total_optimizer_steps = steps_per_epoch * int(config["max_epochs"])
+        scheduler = build_cosine_warmup_scheduler(
+            optimizer,
+            total_steps=total_optimizer_steps,
+            warmup_pct=float(config.get("warmup_pct", 0.07)),
+            min_lr_ratio=float(config.get("cosine_min_lr_ratio", 0.01)),
+        )
+        scheduler_kind = "cosine_warmup"
+    else:
+        lr_plat = int(config.get("lr_plateau_patience", 3))
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=lr_plat, min_lr=1e-7
+        )
+        scheduler_kind = "reduce_on_train_loss"
+    print(f"  [Scheduler] {scheduler_kind}")
+    print("  [Final train] No validation split is used; checkpoint selection is the last epoch.")
+
+    scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
+    out_dir = Path(config.get("output_dir", OUTPUT_DIR))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    max_epochs = 1 if dry_run else config["max_epochs"]
+    ga = int(config.get("grad_accum_steps", 1))
+
+    final_train_loss = None
+    for epoch in range(1, max_epochs + 1):
+        lr_dec = optimizer.param_groups[-1]["lr"]
+        print(f"\n  Epoch {epoch}/{max_epochs}  (decoder lr={lr_dec:.2e}, accum={ga})")
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, device,
+            grad_accum_steps=ga,
+            scheduler=scheduler,
+            step_scheduler_per_batch=(scheduler_kind == "cosine_warmup"),
+            ema=ema,
+            ema_source=ema_source,
+        )
+        final_train_loss = train_loss
+        if scheduler_kind == "reduce_on_train_loss":
+            scheduler.step(train_loss)
+
+        print(f"  Train Loss: {train_loss:.4f}")
+        if use_wandb and wandb.run is not None:
+            enc_lr = optimizer.param_groups[0]["lr"]
+            dec_lr = optimizer.param_groups[-1]["lr"]
+            wandb.log({
+                "final/train_loss": train_loss,
+                "final/lr_encoder": enc_lr,
+                "final/lr_decoder": dec_lr,
+                "final/epoch": epoch,
+            })
+
+        if dry_run:
+            break
+
+    ckpt_name = str(config.get("final_checkpoint_name", "final_all_folds.pth"))
+    if not ckpt_name.endswith(".pth"):
+        ckpt_name += ".pth"
+    ckpt_path = out_dir / ckpt_name
+    to_save = ema.ema.state_dict() if ema is not None else _trainable_model(model).state_dict()
+    torch.save(to_save, ckpt_path)
+
+    metadata = {
+        "checkpoint_path": str(ckpt_path),
+        "checkpoint_source": "EMA" if ema is not None else "raw",
+        "folds": list(fold_names),
+        "data_summary": data_summary,
+        "epochs_trained": int(max_epochs),
+        "dry_run": bool(dry_run),
+        "final_train_loss": float(final_train_loss) if final_train_loss is not None else None,
+        "config": {
+            "batch_size": config["batch_size"],
+            "grad_accum_steps": config.get("grad_accum_steps", 1),
+            "effective_batch": config["batch_size"] * config.get("grad_accum_steps", 1),
+            "learning_rate": config["learning_rate"],
+            "weight_decay": config["weight_decay"],
+            "max_epochs": config["max_epochs"],
+            "scheduler": scheduler_kind,
+            "class_weights": list(config["class_weights"]),
+            "dice_weight": config["dice_weight"],
+            "ce_weight": config["ce_weight"],
+            "unfreeze_last": config["unfreeze_last"],
+            "use_weighted_sampler": config.get("use_weighted_sampler", False),
+            "sampler_replacement": config.get("sampler_replacement", False),
+            "norm_mean": list(config["norm_mean"]),
+            "norm_std": list(config["norm_std"]),
+            "color_aug_enabled": config.get("color_aug_enabled", True),
+            "use_ema": config.get("use_ema", False),
+            "ema_decay": config.get("ema_decay", 0.999),
+            "seed": config.get("seed", DEFAULT_SEED),
+        },
+    }
+    metadata_path = ckpt_path.with_suffix(".json")
+    with metadata_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\n  [Final train] Saved checkpoint: {ckpt_path}")
+    print(f"  [Final train] Saved metadata:   {metadata_path}")
+    return {
+        "checkpoint_path": ckpt_path,
+        "metadata_path": metadata_path,
+        "final_train_loss": final_train_loss,
+        "data_summary": data_summary,
+    }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Reporting — identical to the original
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1168,6 +1383,31 @@ def main():
     parser.add_argument("--wandb-name", type=str, default=None, help="Nombre del run (optional).")
     parser.add_argument("--fold", type=str, nargs="+", default=None, choices=["Val1", "Val2", "Val3", "Val4"], help="Run one or multiple specific folds (e.g., Val1 Val2). If not set, all 4 folds run.")
     parser.add_argument(
+        "--final-train",
+        action="store_true",
+        help=(
+            "Train one final inference model on the deduplicated union of Train.xlsx and "
+            "Test.xlsx from the selected folds. No validation/early stopping is used."
+        ),
+    )
+    parser.add_argument(
+        "--final-folds",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["Val1", "Val2", "Val3", "Val4"],
+        help=(
+            "Folds used to build the final training union. Defaults to --fold when provided, "
+            "otherwise Val1 Val2 Val3 Val4."
+        ),
+    )
+    parser.add_argument(
+        "--final-checkpoint-name",
+        type=str,
+        default="final_all_folds.pth",
+        help="Filename for the final inference checkpoint saved inside --output-dir.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -1263,7 +1503,17 @@ def main():
         config["class_weights"] = parsed
 
     config["output_dir"] = Path(args.output_dir).resolve() if args.output_dir else OUTPUT_DIR
+    config["final_checkpoint_name"] = args.final_checkpoint_name
     print(f"Checkpoints -> {config['output_dir']}")
+
+    if args.fold:
+        fold_names = args.fold if isinstance(args.fold, list) else [args.fold]
+    else:
+        fold_names = ["Val1", "Val2", "Val3", "Val4"]
+    if args.final_folds:
+        final_fold_names = args.final_folds if isinstance(args.final_folds, list) else [args.final_folds]
+    else:
+        final_fold_names = fold_names
 
     eff = config["batch_size"] * config.get("grad_accum_steps", 1)
     print(
@@ -1287,7 +1537,10 @@ def main():
 
     use_wandb = not args.no_wandb
     wandb_config = {
-        "script": "training_conch",
+        "script": "training_conchv2",
+        "final_train": args.final_train,
+        "final_folds": list(final_fold_names),
+        "final_checkpoint_name": config["final_checkpoint_name"],
         "img_size": IMG_SIZE,
         "encoder": "CONCH_ViT-B-16_visual",
         "fpn_channels": config["fpn_channels"],
@@ -1326,7 +1579,7 @@ def main():
         "pixel_frac_partition": [float(x) for x in _PIXEL_FRAC_PARTITION],
         "lr_plateau_patience": config.get("lr_plateau_patience", 3),
         "seed": config.get("seed", DEFAULT_SEED),
-        "fold": args.fold,
+        "fold": list(fold_names),
     }
     if norm_warning:
         wandb_config["norm_warning"] = norm_warning
@@ -1341,34 +1594,45 @@ def main():
                 project=args.wandb_project,
                 name=run_name,
                 config=wandb_config,
-                tags=["mask_lut", "CONCH", "SICAPv2"],
+                tags=["mask_lut", "CONCH", "SICAPv2", "final_train" if args.final_train else "crossval"],
             )
         except Exception as e:
             print(f"  [WARN] Weights & Biases unavailable: {e}")
             use_wandb = False
 
-    if args.fold:
-        fold_names = args.fold if isinstance(args.fold, list) else [args.fold]
+    if args.final_train:
+        final_res = train_final_model(
+            final_fold_names,
+            config,
+            device,
+            args.dry_run,
+            use_wandb=use_wandb,
+        )
+        if use_wandb and wandb.run is not None:
+            wandb.log({
+                "final/unique_images": final_res["data_summary"]["unique_images"],
+                "final/duplicates_removed": final_res["data_summary"]["duplicates_removed"],
+            })
+            wandb.run.summary["final/checkpoint_path"] = str(final_res["checkpoint_path"])
+            wandb.run.summary["final/metadata_path"] = str(final_res["metadata_path"])
     else:
-        fold_names = ["Val1", "Val2", "Val3", "Val4"]
-        
-    aggregated_cm = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
+        aggregated_cm = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
 
-    for fold in fold_names:
-        res = train_fold(fold, config, device, args.dry_run, use_wandb=use_wandb)
-        if res["best_cm"] is not None:
-            aggregated_cm += res["best_cm"]
+        for fold in fold_names:
+            res = train_fold(fold, config, device, args.dry_run, use_wandb=use_wandb)
+            if res["best_cm"] is not None:
+                aggregated_cm += res["best_cm"]
 
-    print_aggregated_matrices(aggregated_cm)
-    if use_wandb and wandb.run is not None:
-        agg_log = {"aggregated/macro_f1": _aggregated_macro_f1_from_cm(aggregated_cm)}
-        for c, name in enumerate(CLASS_NAMES):
-            tp = aggregated_cm[c, c]
-            fp = aggregated_cm[:, c].sum() - tp
-            fn = aggregated_cm[c, :].sum() - tp
-            f1 = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8) if (tp + fp + fn) > 0 else 0.0
-            agg_log[f"aggregated/f1_{name}"] = float(f1)
-        wandb.log(agg_log)
+        print_aggregated_matrices(aggregated_cm)
+        if use_wandb and wandb.run is not None:
+            agg_log = {"aggregated/macro_f1": _aggregated_macro_f1_from_cm(aggregated_cm)}
+            for c, name in enumerate(CLASS_NAMES):
+                tp = aggregated_cm[c, c]
+                fp = aggregated_cm[:, c].sum() - tp
+                fn = aggregated_cm[c, :].sum() - tp
+                f1 = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8) if (tp + fp + fn) > 0 else 0.0
+                agg_log[f"aggregated/f1_{name}"] = float(f1)
+            wandb.log(agg_log)
     if args.dry_run:
         print("\n✅ Dry run completed successfully!")
     if wandb.run is not None:

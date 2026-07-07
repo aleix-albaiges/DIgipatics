@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +37,7 @@ from inspect_pandas_masks import (  # type: ignore
     summarize_mask,
     get_tiff_structure,
 )
+from wsi_resolution import choose_resolution_plan, resize_to_scale
 try:
     from training_conch_final import CONCHSegModel
 except ModuleNotFoundError:
@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-cases", type=int, default=5)
     parser.add_argument("--max-tiles-per-case", type=int, default=12)
     parser.add_argument("--tile-size", type=int, default=512)
-    parser.add_argument("--stride", type=int, default=512)
+    parser.add_argument("--stride", type=int, default=256)
     parser.add_argument(
         "--blend-mode",
         type=str,
@@ -120,7 +120,18 @@ def parse_args() -> argparse.Namespace:
         help="Gaussian sigma = tile_size / gaussian_sigma_scale (only gaussian_sum).",
     )
     parser.add_argument("--target-magnification", type=float, default=10.0)
-    parser.add_argument("--source-magnification", type=float, default=40.0)
+    parser.add_argument(
+        "--target-mpp",
+        type=float,
+        default=None,
+        help="Target microns per pixel. If omitted, target_magnification is converted with 10/mag.",
+    )
+    parser.add_argument(
+        "--source-magnification",
+        type=float,
+        default=None,
+        help="Fallback source magnification only when TIFF resolution tags do not provide mpp.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--thumb-size", type=int, default=1024)
@@ -224,35 +235,27 @@ def load_train_metadata(train_csv: Optional[Path], data_dir: Path) -> Dict[str, 
     return out
 
 
-def level_downsamples(structure: Dict[str, object]) -> List[float]:
-    level_shapes = structure["level_shapes"]
-    base_h, base_w = level_shapes[0][0], level_shapes[0][1]
-    factors: List[float] = []
-    for shape in level_shapes:
-        h, w = shape[0], shape[1]
-        factors.append(float((base_h / h + base_w / w) / 2.0))
-    return factors
-
-
-def choose_level_for_magnification(structure: Dict[str, object], source_magnification: float, target_magnification: float) -> Tuple[int, float]:
-    desired_downsample = float(source_magnification) / float(target_magnification)
-    factors = level_downsamples(structure)
-    level_index = min(range(len(factors)), key=lambda idx: abs(math.log(factors[idx] + 1e-8) - math.log(desired_downsample + 1e-8)))
-    effective_magnification = float(source_magnification) / factors[level_index]
-    return level_index, effective_magnification
-
-
 def inspect_case(
     mask_path: Path,
     wsi_path: Path,
-    source_magnification: float,
+    source_magnification: Optional[float],
     target_magnification: float,
+    target_mpp: Optional[float],
     train_meta: Optional[Dict[str, str]] = None,
 ) -> CaseInfo:
     mask_structure = get_tiff_structure(mask_path)
     wsi_structure = get_tiff_structure(wsi_path)
     # Para decidir esquema/clases, we avoid the lowest level (it can lose labels).
-    preview_level, _ = choose_level_for_magnification(mask_structure, source_magnification, target_magnification)
+    preview_plan = choose_resolution_plan(
+        mask_structure,
+        target_magnification=target_magnification,
+        source_magnification=source_magnification,
+        target_mpp=target_mpp,
+    )
+    preview_level = preview_plan.level_index
+    num_mask_levels = int(mask_structure["num_levels"])
+    if num_mask_levels > 2:
+        preview_level = min(max(preview_level, 1), num_mask_levels - 2)
     mask_preview = read_tiff_level(mask_path, preview_level)
     mask_summary = summarize_mask(mask_preview, max_unique_report=32, exact_decode=False, structure=mask_structure)
     observed_labels = [int(v) for v in mask_summary.get("derived_label_ids", mask_summary.get("palette_values", []))]
@@ -297,8 +300,9 @@ def discover_cases(
     explicit_case_ids: Optional[Sequence[str]],
     allow_karolinska: bool,
     max_cases: int,
-    source_magnification: float,
+    source_magnification: Optional[float],
     target_magnification: float,
+    target_mpp: Optional[float],
     train_metadata: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> List[CaseInfo]:
     candidates: List[CaseInfo] = []
@@ -314,6 +318,7 @@ def discover_cases(
             Path(pair.wsi_path),
             source_magnification=source_magnification,
             target_magnification=target_magnification,
+            target_mpp=target_mpp,
             train_meta=(train_metadata or {}).get(pair.case_id),
         )
         if not case.can_map_gleason and not allow_karolinska:
@@ -753,7 +758,8 @@ def run_case(
     batch_size: int,
     device: torch.device,
     target_magnification: float,
-    source_magnification: float,
+    source_magnification: Optional[float],
+    target_mpp: Optional[float],
     max_tiles_per_case: int,
     tissue_threshold: float,
     min_tumor_fraction: float,
@@ -768,10 +774,23 @@ def run_case(
     gt_geojson_fill_opacity: float,
     geojson_skip_nc: bool,
 ) -> Dict[str, object]:
-    level_index, effective_mag = choose_level_for_magnification(case.wsi_structure, source_magnification, target_magnification)
-    LOGGER.info("Case %s -> level %s (effective %.2fx)", case.case_id, level_index, effective_mag)
-    wsi = read_tiff_level(case.wsi_path, level_index)
-    mask = read_tiff_level(case.mask_path, level_index)
+    plan = choose_resolution_plan(
+        case.wsi_structure,
+        target_magnification=target_magnification,
+        source_magnification=source_magnification,
+        target_mpp=target_mpp,
+    )
+    LOGGER.info(
+        "Case %s -> level %s, read_scale %.3f, output %.2fx (%.3f mpp), source=%s",
+        case.case_id,
+        plan.level_index,
+        plan.read_scale,
+        plan.output_magnification or target_magnification,
+        plan.target_mpp or 0.0,
+        plan.source,
+    )
+    wsi = read_tiff_level(case.wsi_path, plan.level_index)
+    mask = read_tiff_level(case.mask_path, plan.level_index)
     if wsi.ndim == 2:
         wsi = np.repeat(wsi[..., None], 3, axis=2)
     elif wsi.ndim == 3 and wsi.shape[0] in {3, 4} and wsi.shape[-1] not in {3, 4}:
@@ -780,6 +799,7 @@ def run_case(
         wsi = wsi[..., :3]
     if wsi.dtype != np.uint8:
         wsi = normalize_to_uint8(wsi)
+    wsi = resize_to_scale(wsi, plan.read_scale, is_mask=False)
     if mask.ndim == 3 and mask.shape[0] in {1, 3, 4} and mask.shape[-1] not in {1, 3, 4}:
         mask = np.moveaxis(mask, 0, -1)
     if mask.ndim == 3 and mask.shape[-1] == 1:
@@ -788,6 +808,9 @@ def run_case(
         mapped_mask = remap_pandas_mask_to_binary(mask, case.schema_name)
     else:
         mapped_mask = remap_pandas_mask_to_sicap(mask, case.pandas_to_sicap)
+    mapped_mask = resize_to_scale(mapped_mask, plan.read_scale, is_mask=True)
+    if mapped_mask.shape[:2] != wsi.shape[:2]:
+        mapped_mask = cv2.resize(mapped_mask, (wsi.shape[1], wsi.shape[0]), interpolation=cv2.INTER_NEAREST)
 
     tiles = enumerate_tiles(
         image=wsi,
@@ -798,7 +821,7 @@ def run_case(
         min_tumor_fraction=min_tumor_fraction,
     )[:max_tiles_per_case]
     if not tiles:
-        raise RuntimeError(f"No valid tiles found for case {case.case_id} at level {level_index}")
+        raise RuntimeError(f"No valid tiles found for case {case.case_id} at level {plan.level_index}")
 
     case_dir = output_dir / case.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -856,8 +879,11 @@ def run_case(
                     "tile_index": idx,
                     "x": int(tile["x"]),
                     "y": int(tile["y"]),
-                    "level_index": level_index,
-                    "effective_magnification": effective_mag,
+                    "level_index": plan.level_index,
+                    "level_downsample": plan.level_downsample,
+                    "output_downsample": plan.output_downsample,
+                    "read_scale": plan.read_scale,
+                    "effective_magnification": plan.output_magnification,
                     "tumor_fraction": float(tile["tumor_fraction"]),
                     "tissue_fraction": float(tile["tissue_fraction"]),
                     **{f"dice_{name}": metrics["dice_per_class"][name] for name in class_names},
@@ -873,7 +899,7 @@ def run_case(
                         tile_index=idx,
                         x=int(tile["x"]),
                         y=int(tile["y"]),
-                        level_index=level_index,
+                        level_index=plan.level_index,
                         tumor_fraction=float(tile["tumor_fraction"]),
                         tissue_fraction=float(tile["tissue_fraction"]),
                         metrics=metrics,
@@ -899,8 +925,7 @@ def run_case(
         gt_canvas=gt_canvas,
         coverage=coverage,
     )
-    downsample_factors = level_downsamples(case.wsi_structure)
-    level_downsample = downsample_factors[level_index]
+    output_downsample = plan.output_downsample
 
     binary_geojson_name: Optional[str] = None
     pred_gleason_geojson_name: Optional[str] = None
@@ -911,7 +936,7 @@ def run_case(
             case_dir=case_dir,
             case_id=case.case_id,
             pred_canvas=pred_canvas,
-            level_downsample=level_downsample,
+            level_downsample=output_downsample,
         )
     elif export_gleason_geojson:
         pred_gleason_geojson_name, gt_gleason_geojson_name = save_gleason_geojson_pair(
@@ -919,7 +944,7 @@ def run_case(
             case_id=case.case_id,
             pred_canvas=pred_canvas,
             gt_canvas=gt_canvas,
-            level_downsample=level_downsample,
+            level_downsample=output_downsample,
             class_names=class_names,
             skip_nc=geojson_skip_nc,
             gt_blur_sigma=gt_geojson_blur_sigma,
@@ -934,8 +959,8 @@ def run_case(
         "schema_name": case.schema_name,
         "binary_cancer_mode": bool(binary_cancer_mode),
         "observed_labels": case.observed_labels,
-        "level_index": level_index,
-        "effective_magnification": effective_mag,
+        **plan.as_dict(),
+        "effective_magnification": plan.output_magnification,
         "num_tiles": len(tile_rows),
         "blend_mode": effective_blend_mode,
         "aggregate_metrics": aggregate_metrics,
@@ -968,6 +993,7 @@ def main() -> None:
         max_cases=args.max_cases,
         source_magnification=args.source_magnification,
         target_magnification=args.target_magnification,
+        target_mpp=args.target_mpp,
         train_metadata=train_metadata,
     )
     num_classes = 2 if args.binary_cancer_mode else 4
@@ -987,6 +1013,7 @@ def main() -> None:
                 device=device,
                 target_magnification=args.target_magnification,
                 source_magnification=args.source_magnification,
+                target_mpp=args.target_mpp,
                 max_tiles_per_case=args.max_tiles_per_case,
                 tissue_threshold=args.tissue_threshold,
                 min_tumor_fraction=args.min_tumor_fraction,
@@ -1011,7 +1038,8 @@ def main() -> None:
         "resolved_checkpoint_path": str(checkpoint_path),
         "device": str(device),
         "target_magnification": float(args.target_magnification),
-        "source_magnification": float(args.source_magnification),
+        "target_mpp": None if args.target_mpp is None else float(args.target_mpp),
+        "source_magnification": None if args.source_magnification is None else float(args.source_magnification),
         "tile_size": int(args.tile_size),
         "stride": int(args.stride),
         "batch_size": int(args.batch_size),

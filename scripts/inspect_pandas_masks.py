@@ -80,6 +80,69 @@ def open_tiff(path: Path):
     return image
 
 
+def _tag_value(page, tag_name: str):
+    if tag_name not in page.tags:
+        return None
+    value = page.tags[tag_name].value
+    return getattr(value, "value", value)
+
+
+def _rational_to_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, tuple) and len(value) == 2:
+        numerator, denominator = value
+        denominator = float(denominator)
+        if denominator == 0:
+            return None
+        return float(numerator) / denominator
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolution_unit_um(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        unit = int(getattr(value, "value", value))
+    except (TypeError, ValueError):
+        return None
+    if unit == 2:
+        return 25400.0
+    if unit == 3:
+        return 10000.0
+    return None
+
+
+def _page_mpp(page) -> Dict[str, Optional[float]]:
+    x_resolution = _rational_to_float(_tag_value(page, "XResolution"))
+    y_resolution = _rational_to_float(_tag_value(page, "YResolution"))
+    unit_um = _resolution_unit_um(_tag_value(page, "ResolutionUnit"))
+
+    mpp_x = unit_um / x_resolution if unit_um is not None and x_resolution else None
+    mpp_y = unit_um / y_resolution if unit_um is not None and y_resolution else None
+    mpp_values = [value for value in (mpp_x, mpp_y) if value is not None and value > 0]
+    mpp = float(sum(mpp_values) / len(mpp_values)) if mpp_values else None
+    return {
+        "x_resolution": x_resolution,
+        "y_resolution": y_resolution,
+        "mpp_x": mpp_x,
+        "mpp_y": mpp_y,
+        "mpp": mpp,
+    }
+
+
+def _serializable_resolution_unit(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def get_tiff_structure(path: Path) -> Dict[str, object]:
     import tifffile
 
@@ -87,6 +150,7 @@ def get_tiff_structure(path: Path) -> Dict[str, object]:
         series = tif.series[0]
         levels = getattr(series, "levels", [series])
         page0 = series.pages[0]
+        resolution_unit = _tag_value(page0, "ResolutionUnit")
         return {
             "series_shape": list(series.shape),
             "series_dtype": str(series.dtype),
@@ -94,6 +158,8 @@ def get_tiff_structure(path: Path) -> Dict[str, object]:
             "level_shapes": [list(level.shape) for level in levels],
             "compression": str(getattr(page0, "compression", "unknown")),
             "is_tiled": bool(getattr(page0, "is_tiled", False)),
+            "resolution_unit": _serializable_resolution_unit(resolution_unit),
+            **_page_mpp(page0),
         }
 
 

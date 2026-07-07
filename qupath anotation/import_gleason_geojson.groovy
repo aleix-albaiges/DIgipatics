@@ -8,7 +8,7 @@
  *
  * Usa Gson (incluido en QuPath), no groovy.json.JsonSlurper.
  *
- * Ajusta inferenceOutputRoot y ejecuta con una imagen abierta.
+ * Ajusta candidateInferenceRoots y ejecuta con una imagen abierta.
  */
 
 import com.google.gson.JsonParser
@@ -46,14 +46,19 @@ def registerGleasonPathClassesInProject() {
 }
 
 // --- CONFIG ---
-def inferenceOutputRoot = 'C:/Users/Aleix/OneDrive - Universitat Politècnica de Catalunya/Escritorio/UNI/TFG/Recerca primers datasets/SicapV2/SICAPv2/outputs/pandas_tile_inference_gleason_geojson'
+def repoRoot = 'C:/Users/Aleix/OneDrive - Universitat Politècnica de Catalunya/Escritorio/UNI/TFG/Recerca primers datasets/SicapV2/SICAPv2'
+def candidateInferenceRoots = [
+    buildFilePath(repoRoot, 'outputs', 'sicap_inference_10x_final_all_folds'),
+    buildFilePath(repoRoot, 'outputs', 'pandas_tile_inference_gleason_geojson_10x_final_all_folds'),
+    buildFilePath(repoRoot, 'outputs', 'pandas_tile_inference_gleason_geojson')
+]
 def predGeojsonName = 'case_pred_gleason_annotations.geojson'
 def gtGeojsonName = 'case_gt_gleason_annotations_soft.geojson'
 def importPrediction = true
-def importGroundTruth = true
+def importGroundTruth = false
 /** Prefijo para clases GT en QuPath (ej. "GT GG3") */
 def gtClassPrefix = 'GT '
-def clearExistingAnnotations = false
+def clearExistingAnnotations = true
 // -------------
 
 /** Lee FeatureCollection y devuelve el array "features" (puede ser null). */
@@ -106,6 +111,18 @@ def assignClassesFromGeoJson(File geojsonFile, String classPrefix) {
     return out
 }
 
+def findCaseBase = { String caseId, String requiredFileName ->
+    for (root in candidateInferenceRoots) {
+        def base = buildFilePath(root, caseId)
+        def geojsonFile = new File(buildFilePath(base, requiredFileName))
+        if (geojsonFile.exists()) {
+            println "Using inference output: ${root}"
+            return base
+        }
+    }
+    return null
+}
+
 def entry = getProjectEntry()
 if (entry == null) {
     print 'No active project entry/image.'
@@ -128,7 +145,15 @@ if (clearExistingAnnotations) {
     }
 }
 
-def base = buildFilePath(inferenceOutputRoot, caseId)
+def base = findCaseBase(caseId, predGeojsonName)
+if (base == null) {
+    println "No prediction GeoJSON found for case '${caseId}'. Checked:"
+    candidateInferenceRoots.each { root ->
+        println "  " + buildFilePath(root, caseId, predGeojsonName)
+    }
+    println "Note: scripts/sicap_infer.py currently writes PNG/NPY mosaics but not GeoJSON annotations."
+    return
+}
 def allAdded = []
 
 if (importPrediction) {
