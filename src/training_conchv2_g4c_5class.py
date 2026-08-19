@@ -542,6 +542,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train CONCH 5-class segmentation with explicit GG4C.")
     parser.add_argument("--base-checkpoint", type=Path, default=DEFAULT_BASE_CHECKPOINT)
     parser.add_argument("--fold", choices=["Val1", "Val2", "Val3", "Val4", "Test"], default="Val3")
+    parser.add_argument(
+        "--train-xlsx",
+        type=Path,
+        default=None,
+        help="Training split Excel to use directly. Overrides fold/final-fold collection and uses no validation set.",
+    )
     parser.add_argument("--final-train", action="store_true")
     parser.add_argument("--final-folds", nargs="+", choices=["Val1", "Val2", "Val3", "Val4", "Test"], default=None)
     parser.add_argument("--g4c-gray-min", type=int, default=125, help="Split inside old GG4 range: [75, min)->GG4, [min,175)->GG4C.")
@@ -594,9 +600,19 @@ def main() -> None:
     print(f"5-class LUT: 25:75->GG3, 75:{args.g4c_gray_min}->GG4, {args.g4c_gray_min}:175->GG4C, 175:255->GG5")
     mask_lut = build_mask_lut(args.g4c_gray_min)
 
-    if args.final_train:
+    if args.train_xlsx is not None:
+        train_names = read_split(args.train_xlsx)
+        val_names = []
+        data_summary = {
+            "training_source": str(args.train_xlsx),
+            "train_rows": len(train_names),
+            "validation": None,
+            "deduplicated": False,
+        }
+    elif args.final_train:
         folds = args.final_folds or ["Val1", "Val2", "Val3", "Val4"]
         train_names, data_summary = collect_final_names(folds)
+        data_summary["training_source"] = "final_folds"
         val_names = []
     else:
         train_path, val_path = split_paths(args.fold)
@@ -760,6 +776,8 @@ def main() -> None:
                 "class_names": CLASS_NAMES,
                 "merged_class_names": MERGED_CLASS_NAMES,
                 "class_weights": class_weights,
+                "training_source": data_summary.get("training_source"),
+                "trained_epochs": int(max_epochs),
                 "final_train_loss": float(train_loss),
                 "data_summary": data_summary,
             },

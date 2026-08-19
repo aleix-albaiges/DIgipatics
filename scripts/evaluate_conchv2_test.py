@@ -12,7 +12,31 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import sys
+import types
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+VENV_SITE_PACKAGES = ROOT / "prostata_env" / "Lib" / "site-packages"
+
+
+def bootstrap_runtime() -> None:
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    for module_name in ("numpy", "pandas", "scipy", "PIL"):
+        try:
+            __import__(module_name)
+        except Exception:
+            pass
+    if VENV_SITE_PACKAGES.exists():
+        sys.path.insert(0, str(VENV_SITE_PACKAGES))
+    if SRC.exists():
+        sys.path.insert(0, str(SRC))
+    sys.modules.setdefault("wandb", types.ModuleType("wandb"))
+
+
+bootstrap_runtime()
 
 import numpy as np
 import torch
